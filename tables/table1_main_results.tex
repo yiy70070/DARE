@@ -1,0 +1,18 @@
+\begin{tabular}{lllll}
+\toprule
+Operator & Coverage & Median Tight. & 95th %ile & Time (s) \\
+\midrule
+Conv2D & 97% & 3.60× & 8.15× & 3.03 \\
+LayerNorm & 100% & 1.95× & 3.43× & 4.05 \\
+BatchNorm & 99% & 2.10× & 3.81× & 2.65 \\
+ReLU & 100% & 1.10× & 1.10× & 0.13 \\
+Softmax & 96% & 1.55× & 5.57× & 2.81 \\
+AvgPooling & 100% & 1.10× & 1.83× & 2.23 \\
+MaxPooling & 100% & 1.10× & 1.77× & 2.21 \\
+Linear & 96% & 2.27× & 6.70× & 4.36 \\
+MatMul & 80% & 2.25× & 7.12× & 2.85 \\
+GEMM & 100% & 7.16× & 138.41× & 3.09 \\
+Attention & 92% & 2.65× & 7.40× & 3.34 \\
+\textbf{Overall} & \textbf{96%} & \textbf{2.20×} & \textbf{8.02×} & \textbf{2.84} \\
+\bottomrule
+\end{tabular}

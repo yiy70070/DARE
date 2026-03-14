@@ -1,0 +1,18 @@
+\caption{Top 5 error sources per operator with 3-component classification. Each entry shows the error source, its component ($\ell$: Storage Linear, $a$: Accumulation, $d$: Demotion), and absolute magnitude. The decomposition follows Equations~\ref{eq:linear_contribution}-\ref{eq:total_contribution}.}
+\label{tab:contribution_detailed}
+\begin{tabular}{l p{12cm}}
+\toprule
+Operator & Top 5 Error Sources \\
+\midrule
+Conv2D & Demotion (d): 5.86e-05 | Accumulation (a): 5.31e-05 | Input Quantization (ℓ): 4.57e-05 | Weight Quantization (ℓ): 3.95e-05 \\
+LayerNorm & Input Quantization (ℓ): 2.34e-03 | Weight Quantization (ℓ): 4.22e-04 | Output Quantization (d): 3.87e-04 | Bias Quantization (ℓ): 3.03e-04 | Statistics (ℓ): 2.44e-04 \\
+BatchNorm & Input Quantization (ℓ): 9.25e-03 | Output Quantization (d): 8.56e-03 | Affine Params (ℓ): 8.49e-03 | Statistics (ℓ): 6.76e-03 \\
+Softmax & Input Quantization (ℓ): 6.83e-03 | Sum Accumulation (a): 4.24e-03 | Output Quantization (d): 4.22e-03 | Exponential (ℓ): 4.17e-03 | Max Subtraction (ℓ): 4.16e-03 \\
+AvgPooling & Demotion (d): 9.39e-04 | Accumulation (a): 2.41e-07 | Input Quantization (ℓ): 0.00e+00 \\
+MaxPooling & Demotion (d): 9.39e-04 | Accumulation (a): 2.41e-07 | Input Quantization (ℓ): 0.00e+00 \\
+Linear & Accumulation (a): 2.60e-04 | Output Quantization (d): 2.38e-04 | Input Quantization (ℓ): 2.09e-04 | Weight Quantization (ℓ): 1.72e-04 | Bias Quantization (ℓ): 1.58e-04 \\
+MatMul & Accumulation (a): 1.33e-04 | Demotion (d): 1.22e-04 | Input Quantization (ℓ): 1.09e-04 | Weight Quantization (ℓ): 9.00e-05 \\
+GEMM & Accumulation (a): 2.59e-04 | Input Quantization (ℓ): 6.64e-05 | Demotion (d): 3.68e-05 | Weight Quantization (ℓ): 1.68e-05 \\
+Attention & matmul2_accumulation_error (ℓ): 1.87e-04 | output_demote_error (ℓ): 1.76e-04 | Input Quantization (ℓ): 1.75e-04 | softmax_numerical_error (ℓ): 1.31e-04 | Scaling (ℓ): 1.21e-04 \\
+\bottomrule
+\end{tabular}

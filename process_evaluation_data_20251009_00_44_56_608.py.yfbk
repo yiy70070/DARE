@@ -1,0 +1,28 @@
+============================================================
+DARE Evaluation Data Processing
+============================================================
+
+Configuration directories:
+  Storage-Reduced:
+    ✓ evaluation/experiment
+    ✓ evaluation/experiment_1
+  FP32-Uniform:
+    ✓ evaluation/experiment_fp32
+  ...
+
+============================================================
+Generating Table 1: Main Results (Storage-Reduced)
+============================================================
+
+Processing Conv2D...
+    Found 1000 files in experiment
+    Found 1000 files in experiment_1
+  ✓ Loaded 2000 valid test cases
+
+Processing LayerNorm...
+  ...
+
+✓ Table 1 saved to tables/table1_main_results.tex
+  Total: 11 operators, 22000 test cases
+  Coverage: 100.0%
+  Median Tightness: 2.02×

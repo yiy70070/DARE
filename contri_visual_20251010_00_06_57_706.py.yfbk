@@ -1,0 +1,572 @@
+import json
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from pathlib import Path
+from typing import Dict, List, Tuple
+from collections import defaultdict
+
+class ContributionAnalyzer:
+    """按照论文3-component decomposition分析误差贡献"""
+    
+    def __init__(self):
+        self.config_dirs = {
+            'Storage-Reduced': [
+                Path('evaluation/experiment'),
+                Path('evaluation/experiment_1')
+            ],
+            'FP32-Uniform': [
+                Path('evaluation/experiment_fp32')
+            ],
+            'FP16-Uniform': [
+                Path('evaluation/experiment_fp16_all')
+            ],
+            'FP16-Comp-FP32-Acc': [
+                Path('evaluation/experiment_fp16_compute_fp32_accum'),
+                Path('evaluation/experiment_fp16_compute_fp_32_accum')
+            ],
+            'BF16-Compute': [
+                Path('evaluation/experiment_bf16')
+            ]
+        }
+        
+        self.operators = ['Conv2D', 'LayerNorm', 'BatchNorm', 'ReLU', 'Softmax', 
+                         'AvgPooling', 'MaxPooling', 'Linear', 'MatMul', 'GEMM', 'Attention']
+        
+        self.operator_filename_map = {
+            'AvgPooling': 'avg_pooling',
+            'MaxPooling': 'pooling',
+            'Conv2D': 'conv2d',
+            'LayerNorm': 'layernorm',
+            'BatchNorm': 'batchnorm',
+            'ReLU': 'relu',
+            'Softmax': 'softmax',
+            'Linear': 'linear',
+            'MatMul': 'matmul',
+            'GEMM': 'gemm',
+            'Attention': 'attention'
+        }
+        
+        # 按照论文的3-component分类
+        self.component_mapping = {
+            # Storage Linear (ℓ): 输入和权重量化
+            'input_storage_error': 'Storage',
+            'weight_storage_error': 'Storage',
+            'bias_storage_error': 'Storage',
+            
+            # Accumulation (a): 累加误差
+            'accumulation_error': 'Accumulation',
+            'sum_accumulation_error': 'Accumulation',
+            'matmul1_accumulation_error': 'Accumulation',
+            
+            # Demotion (d): 输出降精度
+            'output_storage_error': 'Demotion',
+            'demote_error': 'Demotion',
+            
+            # Pooling专用（直接从top_paths提取）
+            'pooling_storage': 'Storage',
+            'pooling_accumulation': 'Accumulation',
+            'pooling_demotion': 'Demotion',
+            
+            # 不确定的都归到Accumulation
+            'max_subtraction_error': 'Accumulation',
+            'exponential_error': 'Accumulation',
+            'mean_error': 'Accumulation',
+            'variance_error': 'Accumulation',
+            'normalization_error': 'Accumulation',
+            'statistics_computation_error': 'Accumulation',
+            'affine_params_error': 'Accumulation',
+            'scaling_error': 'Accumulation',
+        }
+        
+        # 3个组成部分
+        self.component_names = {
+            'Storage': 'Storage Linear (ℓ)',
+            'Accumulation': 'Accumulation (a)',
+            'Demotion': 'Demotion (d)',
+        }
+        
+        # 详细字段名称
+        self.detailed_names = {
+            'input_storage_error': 'Input Quantization',
+            'output_storage_error': 'Output Quantization',
+            'weight_storage_error': 'Weight Quantization',
+            'accumulation_error': 'Accumulation',
+            'demote_error': 'Demotion',
+            'bias_storage_error': 'Bias Quantization',
+            'max_subtraction_error': 'Max Subtraction',
+            'exponential_error': 'Exponential',
+            'sum_accumulation_error': 'Sum Accumulation',
+            'pooling_storage': 'Input Quantization',
+            'pooling_accumulation': 'Accumulation',
+            'pooling_demotion': 'Demotion',
+            'statistics_computation_error': 'Statistics',
+            'affine_params_error': 'Affine Params',
+            'scaling_error': 'Scaling',
+            'matmul1_accumulation_error': 'MatMul Accumulation',
+            'mean_error': 'Mean',
+            'variance_error': 'Variance',
+            'normalization_error': 'Normalization',
+        }
+        
+        # 3种颜色
+        self.component_colors = {
+            'Storage': '#e74c3c',       # 红色
+            'Accumulation': '#27ae60',  # 绿色
+            'Demotion': '#3498db',      # 蓝色
+        }
+    
+    def is_valid_number(self, value) -> bool:
+        if value is None:
+            return False
+        try:
+            value = float(value)
+            return np.isfinite(value) and not np.isnan(value) and value > 0
+        except (ValueError, TypeError):
+            return False
+    
+    def find_json_files(self, operator: str, config_dirs: List[Path]) -> List[Path]:
+        filename = self.operator_filename_map.get(operator, operator.lower())
+        json_files = []
+        
+        for dir_path in config_dirs:
+            if not dir_path.exists():
+                continue
+            pattern = f"*{filename}*.json"
+            found = list(dir_path.glob(pattern))
+            json_files.extend(found)
+            
+        print(f"    ✓ Found {len(json_files)} files for {operator}")
+        return json_files
+    
+    def load_json_data(self, json_file: Path) -> Dict:
+        try:
+            with open(json_file, 'r') as f:
+                return json.load(f)
+        except:
+            return None
+    
+    def extract_pooling_contributions(self, data: Dict) -> Dict:
+        """从Pooling JSON的top_paths_summary提取数据"""
+        try:
+            analyzer_report = data.get('analyzer_report', {})
+            top_paths = analyzer_report.get('top_paths_summary', [])
+            
+            if not top_paths or len(top_paths) == 0:
+                return None
+            
+            # 统计所有top_paths的各项误差
+            storage_errors = []   # 输入量化误差（通过contributors计算）
+            accum_errors = []     # 累加误差
+            demote_errors = []    # 输出降精度误差
+            
+            for path in top_paths:
+                # 获取该path的各项误差
+                demote_error = path.get('demote_error_pixel', 0)
+                accum_estimate = path.get('accum_estimate', 0)
+                num_elements = path.get('num_contributing_elements', 0)
+                
+                # 从top_contributors计算storage error
+                # 每个contributor的contribution包含了input quantization的影响
+                contributors = path.get('top_contributors', [])
+                if contributors and len(contributors) > 0:
+                    # 所有contributors的平均contribution作为storage error的估计
+                    contrib_values = [c.get('contribution', 0) for c in contributors 
+                                    if self.is_valid_number(c.get('contribution', 0))]
+                    if contrib_values:
+                        # Storage error = 平均单个元素的contribution
+                        storage_err = np.mean(contrib_values)
+                        if self.is_valid_number(storage_err):
+                            storage_errors.append(storage_err)
+                
+                # 累加误差和输出误差
+                if self.is_valid_number(accum_estimate):
+                    accum_errors.append(accum_estimate)
+                if self.is_valid_number(demote_error):
+                    demote_errors.append(demote_error)
+            
+            # 计算平均值
+            contributions = {}
+            
+            if storage_errors:
+                contributions['pooling_storage'] = np.mean(storage_errors)
+            
+            if accum_errors:
+                contributions['pooling_accumulation'] = np.mean(accum_errors)
+            
+            if demote_errors:
+                contributions['pooling_demotion'] = np.mean(demote_errors)
+            
+            if not contributions:
+                print(f"      ⚠️  No valid pooling contributions extracted")
+                return None
+            
+            print(f"      Pooling extracted: {list(contributions.keys())}")
+            return contributions
+            
+        except Exception as e:
+            print(f"      ⚠️  Error extracting pooling: {e}")
+            return None
+    
+    def extract_contributions(self, data: Dict, operator: str) -> Dict:
+        """提取contribution数据"""
+        if data is None:
+            return None
+        
+        try:
+            if 'analyzer_report' not in data:
+                return None
+            
+            analyzer_report = data['analyzer_report']
+            
+            # Pooling特殊处理：从top_paths_summary提取
+            if operator in ['AvgPooling', 'MaxPooling']:
+                return self.extract_pooling_contributions(data)
+            
+            # 其他算子：从component_estimates提取
+            if 'component_estimates' in analyzer_report:
+                component_estimates = analyzer_report['component_estimates']
+                
+                if component_estimates and len(component_estimates) > 0:
+                    valid_contributions = {}
+                    for key, value in component_estimates.items():
+                        if self.is_valid_number(value):
+                            valid_contributions[key] = float(value)
+                    
+                    if valid_contributions:
+                        return valid_contributions
+            
+            # 备选：从component_ratios提取
+            if 'component_ratios' in analyzer_report:
+                component_ratios = analyzer_report['component_ratios']
+                actual_err = data['detector'].get('actual_err', 1.0)
+                
+                if component_ratios and len(component_ratios) > 0 and self.is_valid_number(actual_err):
+                    valid_contributions = {}
+                    for key, value in component_ratios.items():
+                        if self.is_valid_number(value):
+                            # 转回绝对值
+                            abs_value = float(value) * actual_err
+                            if self.is_valid_number(abs_value):
+                                valid_contributions[key] = abs_value
+                    
+                    if valid_contributions:
+                        return valid_contributions
+            
+            return None
+            
+        except Exception as e:
+            print(f"      ⚠️  Error: {e}")
+            return None
+    
+    def aggregate_contributions(self, operator: str, config_name: str = None) -> Tuple[Dict, Dict]:
+        """聚合contribution"""
+        
+        if config_name:
+            config_dirs = self.config_dirs.get(config_name, [])
+        else:
+            config_dirs = []
+            for dirs in self.config_dirs.values():
+                config_dirs.extend(dirs)
+        
+        json_files = self.find_json_files(operator, config_dirs)
+        
+        if not json_files:
+            print(f"    ⚠️  No files")
+            return {}, {}
+        
+        all_contributions = defaultdict(list)
+        files_with_data = 0
+        
+        for json_file in json_files:
+            data = self.load_json_data(json_file)
+            contributions = self.extract_contributions(data, operator)
+            
+            if contributions:
+                files_with_data += 1
+                for key, value in contributions.items():
+                    if self.is_valid_number(value):
+                        all_contributions[key].append(value)
+        
+        # 计算平均值
+        detailed_contributions = {}
+        for key, values in all_contributions.items():
+            if len(values) > 0:
+                detailed_contributions[key] = np.mean(values)
+        
+        if not detailed_contributions:
+            print(f"    ⚠️  No valid data")
+            return {}, {}
+        
+        # 聚合到3个组成部分
+        component_contributions = defaultdict(float)
+        for key, value in detailed_contributions.items():
+            component = self.component_mapping.get(key, 'Accumulation')  # 默认Accumulation
+            component_contributions[component] += value
+        
+        print(f"    ✓ {files_with_data}/{len(json_files)} files")
+        
+        # 显示百分比
+        total_err = sum(component_contributions.values())
+        if total_err > 0:
+            comps_str = " | ".join([f"{k}:{(v/total_err)*100:.1f}%" 
+                                   for k, v in sorted(component_contributions.items())])
+            print(f"      {comps_str}")
+        
+        return detailed_contributions, dict(component_contributions)
+    
+    def analyze_all_operators(self, config_name: str = None) -> Tuple[pd.DataFrame, pd.DataFrame]:
+        """分析所有算子"""
+        print(f"\n{'='*70}")
+        print(f"3-Component Error Decomposition Analysis")
+        print(f"Storage (ℓ) | Accumulation (a) | Demotion (d)")
+        if config_name:
+            print(f"Config: {config_name}")
+        else:
+            print(f"Config: All configs combined")
+        print(f"{'='*70}\n")
+        
+        detailed_results = []
+        component_results = []
+        
+        for operator in self.operators:
+            print(f"\n{operator}:")
+            detailed_contribs, comp_contribs = self.aggregate_contributions(operator, config_name)
+            
+            if detailed_contribs:
+                row_detailed = {'operator': operator}
+                row_detailed.update(detailed_contribs)
+                detailed_results.append(row_detailed)
+                
+                row_comp = {'operator': operator}
+                row_comp.update(comp_contribs)
+                component_results.append(row_comp)
+            else:
+                print(f"    ⚠️  Skip")
+        
+        if not detailed_results:
+            print(f"\n❌ No data!")
+            return pd.DataFrame(), pd.DataFrame()
+        
+        df_detailed = pd.DataFrame(detailed_results)
+        df_component = pd.DataFrame(component_results)
+        
+        # 确保3个组成部分列都存在
+        for comp in ['Storage', 'Accumulation', 'Demotion']:
+            if comp not in df_component.columns:
+                df_component[comp] = 0.0
+        
+        print(f"\n{'='*70}")
+        print(f"Summary: {len(df_component)} operators")
+        print(f"{'='*70}")
+        
+        return df_detailed, df_component
+    
+    def plot_stacked_contributions(self, df: pd.DataFrame, save_path: str = 'figures/contribution_breakdown.pdf'):
+        """绘制3-component stacked bar"""
+        
+        if df.empty:
+            print(f"⚠️  Empty")
+            return
+        
+        print(f"\nGenerating plot...")
+        
+        component_order = ['Storage', 'Accumulation', 'Demotion']
+        
+        # 计算总误差
+        df_plot = df.copy()
+        df_plot['total'] = df_plot[component_order].sum(axis=1)
+        
+        # 过滤掉total=0的行
+        df_plot = df_plot[df_plot['total'] > 0]
+        
+        if df_plot.empty:
+            print(f"⚠️  All operators have zero total error")
+            return
+        
+        df_plot = df_plot.sort_values('total', ascending=True)
+        
+        # 计算百分比
+        for comp in component_order:
+            df_plot[f'{comp}_pct'] = (df_plot[comp] / df_plot['total']) * 100
+        
+        # 创建图表
+        fig, ax = plt.subplots(figsize=(18, 14))
+        
+        operators = df_plot['operator'].tolist()
+        y_pos = np.arange(len(operators))
+        
+        # 绘制stacked bars
+        left = np.zeros(len(operators))
+        
+        for comp in component_order:
+            values_pct = df_plot[f'{comp}_pct'].values
+            
+            if np.sum(values_pct) > 0.01:
+                bars = ax.barh(y_pos, values_pct, left=left, 
+                       label=self.component_names[comp],
+                       color=self.component_colors[comp],
+                       edgecolor='white', linewidth=1.5, height=0.7)
+                
+                # 标注百分比
+                for j, (bar, val_pct) in enumerate(zip(bars, values_pct)):
+                    if val_pct > 5:
+                        width = bar.get_width()
+                        x_pos = left[j] + width/2
+                        y_bar = bar.get_y() + bar.get_height()/2
+                        
+                        # 自适应字体
+                        if val_pct > 50:
+                            fontsize = 28
+                        elif val_pct > 20:
+                            fontsize = 24
+                        elif val_pct > 10:
+                            fontsize = 20
+                        else:
+                            fontsize = 18
+                        
+                        ax.text(x_pos, y_bar, f'{val_pct:.0f}%',
+                               ha='center', va='center', 
+                               fontsize=fontsize, fontweight='bold', color='white',
+                               bbox=dict(boxstyle='round,pad=0.3', facecolor='black', 
+                                        alpha=0.3, edgecolor='none'))
+                
+                left += values_pct
+        
+        # 坐标轴
+        ax.set_yticks(y_pos)
+        ax.set_yticklabels(operators, fontsize=33)
+        ax.set_xlabel('Contribution (%)', fontsize=39, fontweight='bold')
+        ax.set_xlim(0, 100)
+        
+        ax.axvline(x=0, color='black', linewidth=3, linestyle='-', alpha=0.8)
+        
+        # 图例
+        ax.legend(loc='lower right', bbox_to_anchor=(1.0, 0.0),
+                 fontsize=30, frameon=True, fancybox=True, shadow=True,
+                 title='Error Components', title_fontsize=33)
+        
+        ax.grid(True, alpha=0.3, axis='x', linestyle='--', linewidth=1.5)
+        ax.set_axisbelow(True)
+        ax.tick_params(axis='x', labelsize=30)
+        
+        plt.tight_layout()
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        plt.close()
+        
+        print(f"✓ Saved to {save_path}")
+    
+    def generate_detailed_table(self, df_detailed: pd.DataFrame, df_component: pd.DataFrame, 
+                               save_path: str = 'tables/contribution_detailed.tex'):
+        """生成详细表格"""
+        
+        print(f"\nGenerating table...")
+        
+        table_rows = []
+        
+        for idx, row in df_detailed.iterrows():
+            operator = row['operator']
+            contribs = {k: v for k, v in row.items() 
+                       if k != 'operator' and self.is_valid_number(v)}
+            
+            if not contribs:
+                continue
+                
+            sorted_contribs = sorted(contribs.items(), key=lambda x: abs(x[1]), reverse=True)[:5]
+            
+            contrib_strs = []
+            for source, value in sorted_contribs:
+                source_name = self.detailed_names.get(source, source)
+                comp = self.component_mapping.get(source, 'Accumulation')
+                comp_symbol = {'Storage': 'ℓ', 'Accumulation': 'a', 'Demotion': 'd'}[comp]
+                contrib_strs.append(f"{source_name} ({comp_symbol}): {value:.2e}")
+            
+            table_rows.append({
+                'Operator': operator,
+                'Top 5 Error Sources': ' | '.join(contrib_strs)
+            })
+        
+        df_table = pd.DataFrame(table_rows)
+        latex_str = df_table.to_latex(index=False, escape=False, column_format='l p{12cm}')
+        
+        caption = (
+            "\\caption{Top 5 error sources per operator with 3-component decomposition.}\n"
+            "\\label{tab:contribution_detailed}\n"
+        )
+        
+        latex_str = latex_str.replace('\\begin{tabular}', caption + '\\begin{tabular}')
+        
+        with open(save_path, 'w') as f:
+            f.write(latex_str)
+        
+        print(f"✓ Saved to {save_path}")
+    
+    def generate_analysis_text(self, df_component: pd.DataFrame,
+                              save_path: str = 'figures/contribution_analysis.txt'):
+        """生成分析"""
+        
+        print(f"\nGenerating analysis...")
+        
+        analysis = "3-COMPONENT ERROR DECOMPOSITION\n"
+        analysis += "="*70 + "\n\n"
+        
+        analysis += "Per-operator breakdown:\n\n"
+        
+        for idx, row in df_component.iterrows():
+            operator = row['operator']
+            storage = row.get('Storage', 0)
+            accumulation = row.get('Accumulation', 0)
+            demotion = row.get('Demotion', 0)
+            total = storage + accumulation + demotion
+            
+            if total == 0:
+                continue
+            
+            storage_pct = (storage / total) * 100
+            accum_pct = (accumulation / total) * 100
+            demote_pct = (demotion / total) * 100
+            
+            dominant = max([('Storage', storage_pct), 
+                           ('Accumulation', accum_pct), 
+                           ('Demotion', demote_pct)], key=lambda x: x[1])
+            
+            analysis += f"• {operator}:\n"
+            analysis += f"  ℓ:{storage_pct:.1f}% | a:{accum_pct:.1f}% | d:{demote_pct:.1f}%\n"
+            analysis += f"  Dominated by {dominant[0]} ({dominant[1]:.1f}%)\n\n"
+        
+        with open(save_path, 'w') as f:
+            f.write(analysis)
+        
+        print(f"✓ Saved to {save_path}")
+    
+    def run_full_analysis(self, config_name: str = None):
+        """运行分析"""
+        print("\n" + "="*70)
+        print("3-Component Decomposition (ℓ, a, d)")
+        print("="*70)
+        
+        Path('figures').mkdir(exist_ok=True)
+        Path('tables').mkdir(exist_ok=True)
+        Path('data').mkdir(exist_ok=True)
+        
+        df_detailed, df_component = self.analyze_all_operators(config_name)
+        
+        if df_component.empty:
+            print("\n❌ Failed!")
+            return
+        
+        df_detailed.to_csv('data/contribution_detailed.csv', index=False)
+        df_component.to_csv('data/contribution_3component.csv', index=False)
+        
+        self.plot_stacked_contributions(df_component, 'figures/contribution_breakdown.pdf')
+        self.generate_detailed_table(df_detailed, df_component, 'tables/contribution_detailed.tex')
+        self.generate_analysis_text(df_component, 'figures/contribution_analysis.txt')
+        
+        print("\n" + "="*70)
+        print("Complete!")
+        print("="*70)
+
+
+if __name__ == "__main__":
+    analyzer = ContributionAnalyzer()
+    analyzer.run_full_analysis()

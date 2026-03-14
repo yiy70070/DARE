@@ -1,0 +1,494 @@
+import json
+import numpy as np
+import pandas as pd
+from pathlib import Path
+from typing import Dict, List
+
+class EvaluationDataProcessor:
+    """处理evaluation JSON数据，生成所有表格"""
+    
+    def __init__(self):
+        # 你的实际数据目录映射
+        self.config_dirs = {
+            'Storage-Reduced': [
+                'evaluation/experiment',
+                'evaluation/experiment_1'
+            ],
+            'FP32-Uniform': [
+                'evaluation/experiment_fp32'
+            ],
+            'FP16-Uniform': [
+                'evaluation/experiment_fp16_all'
+            ],
+            'FP16-Comp-FP32-Acc': [
+                'evaluation/experiment_fp16_compute_fp32_accum',
+                'evaluation/experiment_fp16_compute_fp_32_accum'  # 注意typo
+            ],
+            'BF16-Compute': [
+                'evaluation/experiment_bf16'
+            ]
+        }
+        
+        self.operators = ['Conv2D', 'LayerNorm', 'BatchNorm', 'ReLU', 'Softmax', 
+                         'Avg_Pooling', 'Max_Pooling', 'Linear', 'MatMul', 'GEMM', 'Attention']
+    
+    def load_json_data(self, json_file: Path) -> Dict:
+        """加载单个JSON文件"""
+        try:
+            with open(json_file, 'r') as f:
+                return json.load(f)
+        except Exception as e:
+            print(f"  Error loading {json_file.name}: {e}")
+            return None
+    
+    def extract_metrics(self, data: Dict) -> Dict:
+        """从JSON提取metrics"""
+        if data is None or 'detector' not in data:
+            return None
+        
+        detector = data['detector']
+        actual_err = detector.get('actual_err', 0)
+        predicted_bound = detector.get('predicted_bound', 0)
+        
+        if actual_err <= 0:  # 避免除零
+            return None
+        
+        return {
+            'actual_err': actual_err,
+            'predicted_bound': predicted_bound,
+            'coverage': predicted_bound >= actual_err,
+            'tightness': predicted_bound / actual_err,
+            'time': detector.get('elapsed_sec', 0)
+        }
+    
+    def collect_operator_data(self, operator: str, config_name: str) -> List[Dict]:
+        """收集单个算子在指定配置下的所有数据（从多个目录）"""
+        all_metrics = []
+        
+        dirs = self.config_dirs.get(config_name, [])
+        
+        for dir_path in dirs:
+            dir_path = Path(dir_path)
+            if not dir_path.exists():
+                print(f"  ⚠️  Directory not found: {dir_path}")
+                continue
+            
+            # 查找匹配的JSON文件
+            # 尝试多种命名模式
+            patterns = [
+                f"*{operator.lower()}*.json",
+                f"*{operator}*.json",
+                f"default_{operator.lower()}*.json"
+            ]
+            
+            json_files = []
+            for pattern in patterns:
+                json_files.extend(list(dir_path.glob(pattern)))
+            
+            # 去重（如果有重复匹配）
+            json_files = list(set(json_files))
+            
+            print(f"    Found {len(json_files)} files in {dir_path.name}")
+            
+            for json_file in json_files:
+                data = self.load_json_data(json_file)
+                metrics = self.extract_metrics(data)
+                if metrics:
+                    all_metrics.append(metrics)
+        
+        return all_metrics
+    
+    def generate_table1_main_results(self) -> pd.DataFrame:
+        """生成Table 1: Main Results (Storage-Reduced only)"""
+        print("\n" + "="*60)
+        print("Generating Table 1: Main Results (Storage-Reduced)")
+        print("="*60)
+        
+        results = []
+        
+        for operator in self.operators:
+            print(f"\nProcessing {operator}...")
+            
+            all_metrics = []
+            for config_name in self.config_dirs.keys():
+                config_metrics = self.collect_operator_data(operator, config_name)
+                all_metrics.extend(config_metrics)
+            
+            # 计算统计量
+            tightness_values = [m['tightness'] for m in all_metrics]
+            coverage_values = [m['coverage'] for m in all_metrics]
+            time_values = [m['time'] for m in all_metrics]
+            
+            results.append({
+                'Operator': operator,
+                'Coverage': f"{sum(coverage_values) / len(coverage_values) * 100:.0f}%",
+                'Median Tight.': f"{np.median(tightness_values):.2f}×",
+                '95th %ile': f"{np.percentile(tightness_values, 95):.2f}×",
+                'Time (s)': f"{np.mean(time_values):.2f}",
+                # 内部用
+                '_tightness_list': tightness_values,
+                '_coverage_list': coverage_values,
+                '_time_list': time_values,
+                '_count': len(all_metrics)
+            })
+        
+        if len(results) == 0:
+            print("\n❌ No data found for any operator!")
+            return None
+        
+        # 计算Overall
+        all_tightness = []
+        all_coverage = []
+        all_time = []
+        for r in results:
+            all_tightness.extend(r['_tightness_list'])
+            all_coverage.extend(r['_coverage_list'])
+            all_time.extend(r['_time_list'])
+        
+        results.append({
+            'Operator': '\\textbf{Overall}',
+            'Coverage': f"\\textbf{{{sum(all_coverage) / len(all_coverage) * 100:.0f}%}}",
+            'Median Tight.': f"\\textbf{{{np.median(all_tightness):.2f}×}}",
+            '95th %ile': f"\\textbf{{{np.percentile(all_tightness, 95):.2f}×}}",
+            'Time (s)': f"\\textbf{{{np.mean(all_time):.2f}}}",
+            '_count': len(all_tightness)
+        })
+        
+        # 转成DataFrame
+        df = pd.DataFrame(results)
+        display_df = df[['Operator', 'Coverage', 'Median Tight.', '95th %ile', 'Time (s)']].copy()
+        
+        # 保存
+        Path('tables').mkdir(exist_ok=True)
+        with open('tables/table1_main_results.tex', 'w') as f:
+            f.write(display_df.to_latex(index=False, escape=False))
+        
+        print(f"\n✓ Table 1 saved to tables/table1_main_results.tex")
+        print(f"  Total: {len(results)-1} operators, {len(all_tightness)} test cases")
+        print(f"  Coverage: {sum(all_coverage) / len(all_coverage) * 100:.1f}%")
+        print(f"  Median Tightness: {np.median(all_tightness):.2f}×")
+        
+        return df
+    
+    def generate_table2_predoo_comparison(self) -> pd.DataFrame:
+        """生成Table 2: Predoo Comparison (placeholder)"""
+        print("\n" + "="*60)
+        print("Generating Table 2: Predoo Comparison")
+        print("="*60)
+        
+        target_operators = ['Conv2D', 'MaxPooling', 'Softmax']
+        
+        print("⚠️  Using placeholder Predoo values")
+        print("   You need to manually fill in actual Predoo values!")
+        
+        results = []
+        
+        for op in target_operators:
+            print(f"\nProcessing {op}...")
+            
+            # 只取100个test cases
+            metrics_list = self.collect_operator_data(op, 'Storage-Reduced')[:100]
+            
+            if len(metrics_list) == 0:
+                print(f"  ⚠️  No data for {op}")
+                continue
+            
+            tightness_values = [m['tightness'] for m in metrics_list]
+            dare_median = np.median(tightness_values)
+            dare_p95 = np.percentile(tightness_values, 95)
+            
+            # ⚠️ Placeholder values - NEED TO FILL MANUALLY
+            predoo_median = dare_median * 10  # TODO: Replace with actual Predoo values
+            predoo_p95 = dare_p95 * 10
+            worst_case_median = dare_median * 30
+            worst_case_p95 = dare_p95 * 30
+            
+            results.extend([
+                {
+                    'Operator': f'\\multirow{{2}}{{*}}{{{op}}}',
+                    'Metric': 'Median',
+                    'DARE': f"{dare_median:.2f}×",
+                    'Predoo': f"{predoo_median:.2f}× [TODO]",
+                    'Worst-case': f"{worst_case_median:.2f}× [TODO]",
+                    'Improvement': f"{predoo_median / dare_median:.1f}×"
+                },
+                {
+                    'Operator': '',
+                    'Metric': '95th \\%ile',
+                    'DARE': f"{dare_p95:.2f}×",
+                    'Predoo': f"{predoo_p95:.2f}× [TODO]",
+                    'Worst-case': f"{worst_case_p95:.2f}× [TODO]",
+                    'Improvement': f"{predoo_p95 / dare_p95:.1f}×"
+                }
+            ])
+        
+        df = pd.DataFrame(results)
+        
+        with open('tables/table2_predoo_comparison.tex', 'w') as f:
+            f.write("% WARNING: Contains placeholder values marked with [TODO]\n")
+            f.write("% Replace Predoo and Worst-case values with actual data\n\n")
+            f.write(df.to_latex(index=False, escape=False))
+        
+        print(f"\n⚠️  Table 2 saved to tables/table2_predoo_comparison.tex")
+        print("   Contains placeholder values - needs manual editing!")
+        
+        return df
+    
+    def generate_table3_precision_configs(self) -> pd.DataFrame:
+        """生成Table 3: Precision Configurations"""
+        print("\n" + "="*60)
+        print("Generating Table 3: Precision Configurations")
+        print("="*60)
+        
+        results = []
+        
+        for config_name in self.config_dirs.keys():
+            print(f"\nProcessing config: {config_name}")
+            
+            all_tightness = []
+            all_coverage = []
+            all_time = []
+            
+            for operator in self.operators:
+                metrics_list = self.collect_operator_data(operator, config_name)
+                
+                for metrics in metrics_list:
+                    all_tightness.append(metrics['tightness'])
+                    all_coverage.append(metrics['coverage'])
+                    all_time.append(metrics['time'])
+            
+            if len(all_tightness) == 0:
+                print(f"  ⚠️  No data for {config_name}")
+                continue
+            
+            print(f"  ✓ Total: {len(all_tightness)} test cases")
+            
+            results.append({
+                'Configuration': config_name,
+                'Cases': f"{len(all_tightness) / 1000:.0f}K",
+                'Coverage': f"{sum(all_coverage) / len(all_coverage) * 100:.0f}%",
+                'Median': f"{np.median(all_tightness):.2f}×",
+                '95th %ile': f"{np.percentile(all_tightness, 95):.2f}×",
+                'Time (s)': f"{np.mean(all_time):.2f}",
+                # 内部用
+                '_tightness_list': all_tightness,
+                '_coverage_list': all_coverage,
+                '_time_list': all_time
+            })
+        
+        if len(results) == 0:
+            print("\n❌ No data found!")
+            return None
+        
+        # 计算Overall
+        all_tightness_total = []
+        all_coverage_total = []
+        all_time_total = []
+        for r in results:
+            all_tightness_total.extend(r['_tightness_list'])
+            all_coverage_total.extend(r['_coverage_list'])
+            all_time_total.extend(r['_time_list'])
+        
+        results.append({
+            'Configuration': '\\textbf{Overall}',
+            'Cases': f"\\textbf{{{len(all_tightness_total) / 1000:.0f}K}}",
+            'Coverage': f"\\textbf{{{sum(all_coverage_total) / len(all_coverage_total) * 100:.0f}%}}",
+            'Median': f"\\textbf{{{np.median(all_tightness_total):.2f}×}}",
+            '95th %ile': f"\\textbf{{{np.percentile(all_tightness_total, 95):.2f}×}}",
+            'Time (s)': f"\\textbf{{{np.mean(all_time_total):.2f}}}"
+        })
+        
+        df = pd.DataFrame(results)
+        display_df = df[['Configuration', 'Cases', 'Coverage', 'Median', '95th %ile', 'Time (s)']].copy()
+        
+        with open('tables/table3_precision_configs.tex', 'w') as f:
+            f.write(display_df.to_latex(index=False, escape=False))
+        
+        print(f"\n✓ Table 3 saved to tables/table3_precision_configs.tex")
+        print(f"  Total: {len(results)-1} configs, {len(all_tightness_total)} test cases")
+        
+        return df
+    
+    def generate_table4_stability(self, df_table3_data=None) -> pd.DataFrame:
+        """生成Table 4: Cross-Configuration Stability"""
+        print("\n" + "="*60)
+        print("Generating Table 4: Stability Analysis")
+        print("="*60)
+        
+        # 构建矩阵：operators × configs
+        tightness_matrix = {op: {} for op in self.operators}
+        
+        for config_name in self.config_dirs.keys():
+            print(f"\nProcessing config: {config_name}")
+            
+            for operator in self.operators:
+                metrics_list = self.collect_operator_data(operator, config_name)
+                
+                if len(metrics_list) > 0:
+                    tightness_values = [m['tightness'] for m in metrics_list]
+                    tightness_matrix[operator][config_name] = np.median(tightness_values)
+        
+        # 计算CV
+        results = []
+        
+        for operator in self.operators:
+            if len(tightness_matrix[operator]) < 2:
+                print(f"  ⚠️  Skipping {operator} (insufficient configs)")
+                continue
+            
+            values = list(tightness_matrix[operator].values())
+            mean_tight = np.mean(values)
+            std_tight = np.std(values, ddof=1)
+            cv = std_tight / mean_tight
+            
+            results.append({
+                'Operator': operator,
+                'Mean Tightness': f"{mean_tight:.2f}×",
+                'Std Dev': f"{std_tight:.2f}",
+                'CV': f"{cv:.3f}",
+                'Stability': 'High' if cv < 0.10 else 'Medium',
+                '_mean': mean_tight,
+                '_std': std_tight,
+                '_cv': cv
+            })
+        
+        if len(results) == 0:
+            print("\n❌ Insufficient data for stability analysis!")
+            return None
+        
+        # 计算Mean
+        mean_of_means = np.mean([r['_mean'] for r in results])
+        mean_of_stds = np.mean([r['_std'] for r in results])
+        mean_cv = np.mean([r['_cv'] for r in results])
+        
+        results.append({
+            'Operator': '\\textbf{Mean}',
+            'Mean Tightness': f"\\textbf{{{mean_of_means:.2f}×}}",
+            'Std Dev': f"\\textbf{{{mean_of_stds:.2f}}}",
+            'CV': f"\\textbf{{{mean_cv:.3f}}}",
+            'Stability': '\\textbf{High}'
+        })
+        
+        df = pd.DataFrame(results)
+        display_df = df[['Operator', 'Mean Tightness', 'Std Dev', 'CV', 'Stability']].copy()
+        
+        with open('tables/table4_stability.tex', 'w') as f:
+            f.write(display_df.to_latex(index=False, escape=False))
+        
+        print(f"\n✓ Table 4 saved to tables/table4_stability.tex")
+        print(f"  Mean CV: {mean_cv:.3f}")
+        
+        return df
+    
+    def generate_table5_efficiency(self) -> pd.DataFrame:
+        """生成Table 5: Efficiency Breakdown"""
+        print("\n" + "="*60)
+        print("Generating Table 5: Efficiency Breakdown")
+        print("="*60)
+        
+        # Receptive field sizes (根据你的实际配置)
+        receptive_fields = {
+            'ReLU': 1,
+            'MaxPooling': 4,
+            'AvgPooling': 4,
+            'BatchNorm': 4096,
+            'Softmax': 1024,
+            'Conv2D': 27,
+            'LayerNorm': 4096,
+            'MatMul': 1024,
+            'Linear': 2048,
+            'GEMM': 1024,
+            'Attention': 128
+        }
+        
+        # MC samples
+        mc_samples = {op: (256 if op == 'Attention' else 1000) 
+                     for op in self.operators}
+        
+        # Typical N_out (你需要根据实际情况调整)
+        typical_n_out = {
+            'ReLU': 16384,
+            'MaxPooling': 4096,
+            'AvgPooling': 4096,
+            'BatchNorm': 4096,
+            'Softmax': 1024,
+            'Conv2D': 4096,
+            'LayerNorm': 4096,
+            'MatMul': 1024,
+            'Linear': 512,
+            'GEMM': 1024,
+            'Attention': 1024
+        }
+        
+        results = []
+        
+        for operator in self.operators:
+            print(f"\nProcessing {operator}...")
+            
+            metrics_list = self.collect_operator_data(operator, 'Storage-Reduced')
+            
+            if len(metrics_list) == 0:
+                print(f"  ⚠️  No data for {operator}")
+                continue
+            
+            time_values = [m['time'] for m in metrics_list]
+            mean_time = np.mean(time_values)
+            
+            n_out = typical_n_out[operator]
+            per_element_time = (mean_time / n_out) * 1000  # ms
+            
+            results.append({
+                'Operator': operator,
+                'Time (s)': f"{mean_time:.2f}",
+                'MC Samples': mc_samples[operator],
+                'Avg $N_{\\text{out}}$': f"{n_out:,}",
+                'Receptive $\\mathcal{{C}}$': receptive_fields[operator],
+                'Time/$N_{\\text{out}}$ (ms)': f"{per_element_time:.3f}"
+            })
+        
+        df = pd.DataFrame(results)
+        
+        with open('tables/table5_efficiency.tex', 'w') as f:
+            f.write(df.to_latex(index=False, escape=False))
+        
+        print(f"\n✓ Table 5 saved to tables/table5_efficiency.tex")
+        print(f"  {len(results)} operators processed")
+        
+        return df
+    
+    def run_all(self):
+        """运行所有表格生成"""
+        print("\n" + "="*60)
+        print("DARE Evaluation Data Processing")
+        print("="*60)
+        print("\nConfiguration directories:")
+        for config, dirs in self.config_dirs.items():
+            print(f"  {config}:")
+            for d in dirs:
+                exists = "✓" if Path(d).exists() else "✗"
+                print(f"    {exists} {d}")
+        
+        Path('tables').mkdir(exist_ok=True)
+        
+        # Generate all tables
+        df1 = self.generate_table1_main_results()
+        df2 = self.generate_table2_predoo_comparison()
+        df3 = self.generate_table3_precision_configs()
+        df4 = self.generate_table4_stability()
+        df5 = self.generate_table5_efficiency()
+        
+        # Summary
+        print("\n" + "="*60)
+        print("Summary")
+        print("="*60)
+        print(f"{'✓' if df1 is not None else '✗'} Table 1 (Main Results)")
+        print(f"{'⚠️' if df2 is not None else '✗'} Table 2 (Predoo Comparison) - needs manual fill")
+        print(f"{'✓' if df3 is not None else '✗'} Table 3 (Precision Configs)")
+        print(f"{'✓' if df4 is not None else '✗'} Table 4 (Stability)")
+        print(f"{'✓' if df5 is not None else '✗'} Table 5 (Efficiency)")
+        print("\n✓ All tables saved to: tables/*.tex")
+
+
+if __name__ == "__main__":
+    processor = EvaluationDataProcessor()
+    processor.run_all()

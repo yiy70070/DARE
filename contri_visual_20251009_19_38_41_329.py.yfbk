@@ -1,0 +1,378 @@
+import json
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from pathlib import Path
+from typing import Dict, List, Tuple
+from collections import defaultdict
+
+class ContributionAnalyzer:
+    """分析每个算子的误差贡献来源"""
+    
+    def __init__(self):
+        # 你的实际数据路径（可能有多个文件夹）
+        self.config_dirs = {
+            'Storage-Reduced': [
+                Path('evaluation/experiment'),
+                Path('evaluation/experiment_1')
+            ],
+            'FP32-Uniform': [
+                Path('evaluation/experiment_fp32')
+            ],
+            'FP16-Uniform': [
+                Path('evaluation/experiment_fp16_all')
+            ],
+            'FP16-Comp-FP32-Acc': [
+                Path('evaluation/experiment_fp16_compute_fp32_accum'),
+                Path('evaluation/experiment_fp16_compute_fp_32_accum')
+            ],
+            'BF16-Compute': [
+                Path('evaluation/experiment_bf16')
+            ]
+        }
+        
+        self.operators = ['Conv2D', 'LayerNorm', 'BatchNorm', 'ReLU', 'Softmax', 
+                         'AvgPooling', 'MaxPooling', 'Linear', 'MatMul', 'GEMM', 'Attention']
+        
+        # 文件名映射
+        self.operator_filename_map = {
+            'AvgPooling': 'avg_pooling',
+            'MaxPooling': 'pooling',
+            'Conv2D': 'conv2d',
+            'LayerNorm': 'layernorm',
+            'BatchNorm': 'batchnorm',
+            'ReLU': 'relu',
+            'Softmax': 'softmax',
+            'Linear': 'linear',
+            'MatMul': 'matmul',
+            'GEMM': 'gemm',
+            'Attention': 'attention'
+        }
+        
+        # Contribution因素的显示名称（根据你的JSON结构调整）
+        self.contribution_names = {
+            'input_quantization': 'Input Quant.',
+            'weight_quantization': 'Weight Quant.',
+            'computation_error': 'Computation',
+            'accumulation_error': 'Accumulation',
+            'output_demotion': 'Output Demotion',
+            'activation_error': 'Activation',
+            'normalization_error': 'Normalization'
+        }
+        
+        # 配色方案
+        self.positive_colors = ['#e74c3c', '#e67e22', '#f39c12', '#27ae60', '#3498db', '#9b59b6', '#34495e']
+        self.negative_colors = ['#c0392b', '#d35400', '#f39c12', '#229954', '#2874a6', '#7d3c98', '#2c3e50']
+    
+    def is_valid_number(self, value) -> bool:
+        """检查数值是否有效"""
+        if value is None:
+            return False
+        try:
+            value = float(value)
+            return np.isfinite(value) and not np.isnan(value)
+        except (ValueError, TypeError):
+            return False
+    
+    def find_json_files(self, operator: str, config_dirs: List[Path]) -> List[Path]:
+        """在多个目录中查找指定算子的JSON文件"""
+        filename = self.operator_filename_map.get(operator, operator.lower())
+        json_files = []
+        
+        for dir_path in config_dirs:
+            if not dir_path.exists():
+                print(f"    ⚠️  Directory not found: {dir_path}")
+                continue
+            
+            pattern = f"*{filename}*.json"
+            found = list(dir_path.glob(pattern))
+            json_files.extend(found)
+            
+        if len(json_files) == 0:
+            print(f"    ⚠️  No files found for {operator}")
+        else:
+            print(f"    ✓ Found {len(json_files)} files for {operator}")
+            
+        return json_files
+    
+    def load_json_data(self, json_file: Path) -> Dict:
+        """加载单个JSON文件"""
+        try:
+            with open(json_file, 'r') as f:
+                return json.load(f)
+        except Exception as e:
+            return None
+    
+    def inspect_json_structure(self, json_file: Path):
+        """检查JSON结构（调试用）"""
+        data = self.load_json_data(json_file)
+        if data:
+            print(f"\n📋 JSON Structure (sample from {json_file.name}):")
+            print(f"Top-level keys: {list(data.keys())}")
+            
+            if 'detector' in data:
+                print(f"detector keys: {list(data['detector'].keys())}")
+                
+                # 打印所有可能包含contribution的字段
+                for key, value in data['detector'].items():
+                    if isinstance(value, dict):
+                        print(f"  {key}: {list(value.keys())}")
+                    elif isinstance(value, (int, float)):
+                        print(f"  {key}: {value}")
+    
+    def extract_contributions(self, data: Dict) -> Dict:
+        """从JSON提取contribution数据 - 需要根据你的实际JSON结构调整"""
+        if data is None:
+            return None
+        
+        try:
+            # 尝试多种可能的JSON结构
+            contributions = None
+            
+            # 可能性1: data['detector']['contributions']
+            if 'detector' in data and 'contributions' in data['detector']:
+                contributions = data['detector']['contributions']
+            
+            # 可能性2: data['contributions']
+            elif 'contributions' in data:
+                contributions = data['contributions']
+            
+            # 可能性3: data['detector']['error_breakdown']
+            elif 'detector' in data and 'error_breakdown' in data['detector']:
+                contributions = data['detector']['error_breakdown']
+            
+            # 可能性4: data['error_sources']
+            elif 'error_sources' in data:
+                contributions = data['error_sources']
+            
+            if not contributions:
+                return None
+            
+            # 过滤掉无效数据
+            valid_contributions = {}
+            for key, value in contributions.items():
+                if self.is_valid_number(value):
+                    valid_contributions[key] = float(value)
+            
+            if len(valid_contributions) == 0:
+                return None
+                
+            return valid_contributions
+            
+        except Exception as e:
+            return None
+    
+    def aggregate_contributions(self, operator: str, config_name: str = None) -> Dict:
+        """聚合单个算子的contribution平均值"""
+        
+        # 确定要扫描的目录
+        if config_name:
+            config_dirs = self.config_dirs.get(config_name, [])
+        else:
+            config_dirs = []
+            for dirs in self.config_dirs.values():
+                config_dirs.extend(dirs)
+        
+        json_files = self.find_json_files(operator, config_dirs)
+        
+        # 如果没找到文件，返回空
+        if not json_files:
+            return {}
+        
+        # 第一次遇到这个算子时，检查JSON结构
+        if operator == 'Conv2D' and len(json_files) > 0:
+            print(f"\n    🔍 Inspecting JSON structure for debugging...")
+            self.inspect_json_structure(json_files[0])
+        
+        # 存储所有valid contributions
+        all_contributions = defaultdict(list)
+        files_with_data = 0
+        
+        for json_file in json_files:
+            data = self.load_json_data(json_file)
+            contributions = self.extract_contributions(data)
+            
+            if contributions:
+                files_with_data += 1
+                for key, value in contributions.items():
+                    all_contributions[key].append(value)
+        
+        # 计算平均值
+        avg_contributions = {}
+        for key, values in all_contributions.items():
+            if len(values) > 0:
+                avg_contributions[key] = np.mean(values)
+        
+        # 报告统计信息
+        if files_with_data > 0:
+            print(f"    ✓ {operator}: {files_with_data}/{len(json_files)} files have valid contribution data")
+            if avg_contributions:
+                print(f"      Contribution keys found: {list(avg_contributions.keys())}")
+        else:
+            print(f"    ⚠️  {operator}: No contribution data found in any file!")
+            print(f"      Please check JSON structure - run with inspect_json_structure()")
+        
+        return avg_contributions
+    
+    def analyze_all_operators(self, config_name: str = None) -> pd.DataFrame:
+        """分析所有算子的contribution"""
+        print(f"\n{'='*70}")
+        print(f"Analyzing contributions for all operators...")
+        if config_name:
+            print(f"Config: {config_name}")
+        else:
+            print(f"Config: All configs combined")
+        print(f"{'='*70}\n")
+        
+        results = []
+        
+        for operator in self.operators:
+            print(f"\n{operator}:")
+            contributions = self.aggregate_contributions(operator, config_name)
+            
+            if contributions:
+                row = {'operator': operator}
+                row.update(contributions)
+                results.append(row)
+            else:
+                print(f"    ⚠️  No valid contribution data for {operator}")
+        
+        if not results:
+            print(f"\n❌ ERROR: No contribution data found for any operator!")
+            print(f"\nPossible reasons:")
+            print(f"  1. JSON files don't contain 'contributions' field")
+            print(f"  2. Field name is different (check the inspect output above)")
+            print(f"  3. All values are NaN/Inf/None")
+            print(f"\nPlease:")
+            print(f"  1. Check the JSON structure inspection above")
+            print(f"  2. Update extract_contributions() method to match your JSON")
+            print(f"  3. Provide a sample JSON file for debugging")
+            return pd.DataFrame()
+        
+        df = pd.DataFrame(results)
+        
+        # 确保所有contribution列都存在
+        for contrib_key in self.contribution_names.keys():
+            if contrib_key not in df.columns:
+                df[contrib_key] = 0.0
+        
+        return df
+    
+    def plot_stacked_contributions(self, df: pd.DataFrame, save_path: str = 'figures/contribution_breakdown.pdf'):
+        """绘制stacked bar chart"""
+        
+        if df.empty:
+            print(f"⚠️  Cannot plot: DataFrame is empty")
+            return
+        
+        print(f"\nGenerating stacked contribution plot...")
+        
+        # 提取contribution列
+        contrib_cols = [col for col in df.columns if col != 'operator']
+        
+        if not contrib_cols:
+            print(f"⚠️  No contribution columns found in DataFrame")
+            return
+        
+        # 分离正负贡献
+        df_positive = df[['operator'] + contrib_cols].copy()
+        df_negative = df[['operator'] + contrib_cols].copy()
+        
+        for col in contrib_cols:
+            df_positive[col] = df[col].apply(lambda x: x if x > 0 else 0)
+            df_negative[col] = df[col].apply(lambda x: x if x < 0 else 0)
+        
+        # 创建图表
+        fig, ax = plt.subplots(figsize=(12, 8))
+        
+        operators = df['operator'].tolist()
+        y_pos = np.arange(len(operators))
+        
+        # 绘制正贡献
+        left_positive = np.zeros(len(operators))
+        for i, col in enumerate(contrib_cols):
+            values = df_positive[col].values
+            if np.sum(np.abs(values)) > 0:
+                ax.barh(y_pos, values, left=left_positive, 
+                       label=self.contribution_names.get(col, col),
+                       color=self.positive_colors[i % len(self.positive_colors)],
+                       edgecolor='white', linewidth=0.5)
+                left_positive += values
+        
+        # 绘制负贡献
+        left_negative = np.zeros(len(operators))
+        for i, col in enumerate(contrib_cols):
+            values = df_negative[col].values
+            if np.sum(np.abs(values)) > 0:
+                ax.barh(y_pos, values, left=left_negative,
+                       color=self.negative_colors[i % len(self.negative_colors)],
+                       alpha=0.7, edgecolor='white', linewidth=0.5,
+                       hatch='//')
+                left_negative += values
+        
+        # 设置坐标轴
+        ax.set_yticks(y_pos)
+        ax.set_yticklabels(operators, fontsize=11)
+        ax.set_xlabel('Contribution to Error (%)', fontsize=12, fontweight='bold')
+        ax.set_title('Error Contribution Breakdown by Operator', 
+                    fontsize=14, fontweight='bold', pad=15)
+        
+        # 添加垂直线
+        ax.axvline(x=0, color='black', linewidth=1.5, linestyle='-', alpha=0.7)
+        
+        # 图例
+        handles, labels = ax.get_legend_handles_labels()
+        by_label = dict(zip(labels, handles))
+        ax.legend(by_label.values(), by_label.keys(), 
+                 loc='center left', bbox_to_anchor=(1, 0.5),
+                 fontsize=9, frameon=True, fancybox=True, shadow=True)
+        
+        # 网格
+        ax.grid(True, alpha=0.3, axis='x', linestyle='--')
+        ax.set_axisbelow(True)
+        
+        plt.tight_layout()
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        plt.close()
+        
+        print(f"✓ Figure saved to {save_path}")
+    
+    def run_full_analysis(self, config_name: str = None):
+        """运行完整分析流程"""
+        print("\n" + "="*70)
+        print("Starting Contribution Analysis")
+        print("="*70)
+        
+        # 创建输出目录
+        Path('figures').mkdir(exist_ok=True)
+        Path('tables').mkdir(exist_ok=True)
+        Path('data').mkdir(exist_ok=True)
+        
+        # 分析数据
+        df = self.analyze_all_operators(config_name)
+        
+        if df.empty:
+            print("\n❌ Analysis failed: No valid data found!")
+            print("\nNext steps:")
+            print("  1. Check the JSON structure inspection above")
+            print("  2. Provide a sample JSON file")
+            print("  3. Update extract_contributions() to match your JSON format")
+            return
+        
+        # 保存原始数据
+        csv_path = 'data/contribution_breakdown.csv'
+        df.to_csv(csv_path, index=False)
+        print(f"\n✓ Raw data saved to {csv_path}")
+        
+        # 生成图表
+        self.plot_stacked_contributions(df, 'figures/contribution_stacked.pdf')
+        
+        print("\n" + "="*70)
+        print("Analysis Complete!")
+        print("="*70)
+
+
+# 使用示例
+if __name__ == "__main__":
+    analyzer = ContributionAnalyzer()
+    analyzer.run_full_analysis()

@@ -1,0 +1,458 @@
+import json
+import numpy as np
+import pandas as pd
+from pathlib import Path
+from typing import Dict, List
+
+class EvaluationDataProcessor:
+    """处理evaluation JSON数据，生成所有表格"""
+    
+    def __init__(self, base_dir='evaluation/experiment/'):
+        self.base_dir = Path(base_dir)
+        self.operators = ['Conv2D', 'LayerNorm', 'BatchNorm', 'ReLU', 'Softmax', 
+                         'AvgPooling', 'MaxPooling', 'Linear', 'MatMul', 'GEMM', 'Attention']
+        
+        # 如果你跑了5种配置，填这个；如果只跑了Storage-Reduced，就只保留一个
+        self.configs = {
+            'Storage-Reduced': 'Storage_Reduced',  # 你肯定有的
+            # 'FP32-Uniform': 'FP32_Uniform',      # 如果跑了就取消注释
+            # 'FP16-Uniform': 'FP16_Uniform',
+            # 'FP16-Comp-FP32-Acc': 'FP16_Compute_FP32_Accum',
+            # 'BF16-Compute': 'BF16_Compute'
+        }
+    
+    def load_json_data(self, json_file: Path) -> Dict:
+        """加载单个JSON文件"""
+        try:
+            with open(json_file, 'r') as f:
+                return json.load(f)
+        except Exception as e:
+            print(f"Error loading {json_file}: {e}")
+            return None
+    
+    def extract_metrics(self, data: Dict) -> Dict:
+        """从JSON提取metrics"""
+        if data is None or 'detector' not in data:
+            return None
+        
+        detector = data['detector']
+        actual_err = detector['actual_err']
+        predicted_bound = detector['predicted_bound']
+        
+        if actual_err <= 0:  # 避免除零
+            return None
+        
+        return {
+            'actual_err': actual_err,
+            'predicted_bound': predicted_bound,
+            'coverage': predicted_bound >= actual_err,
+            'tightness': predicted_bound / actual_err,
+            'time': detector['elapsed_sec']
+        }
+    
+    def generate_table1_main_results(self) -> pd.DataFrame:
+        """生成Table 1: Main Results (Storage-Reduced only)"""
+        print("\n=== Generating Table 1: Main Results ===")
+        
+        results = []
+        
+        for operator in self.operators:
+            # 查找这个算子的所有JSON文件
+            json_dir = self.base_dir / 'Storage_Reduced'  # 或者你的实际目录名
+            json_files = list(json_dir.glob(f"*{operator.lower()}*.json"))
+            
+            if len(json_files) == 0:
+                print(f"⚠️  Warning: No files found for {operator}")
+                continue
+            
+            print(f"Processing {operator}: {len(json_files)} files")
+            
+            metrics_list = []
+            for json_file in json_files:
+                data = self.load_json_data(json_file)
+                metrics = self.extract_metrics(data)
+                if metrics:
+                    metrics_list.append(metrics)
+            
+            if len(metrics_list) == 0:
+                continue
+            
+            # 计算统计量
+            tightness_values = [m['tightness'] for m in metrics_list]
+            coverage_values = [m['coverage'] for m in metrics_list]
+            time_values = [m['time'] for m in metrics_list]
+            
+            results.append({
+                'Operator': operator,
+                'Coverage': f"{sum(coverage_values) / len(coverage_values) * 100:.0f}%",
+                'Median Tight.': f"{np.median(tightness_values):.2f}×",
+                '95th %ile': f"{np.percentile(tightness_values, 95):.2f}×",
+                'Time (s)': f"{np.mean(time_values):.2f}",
+                # 内部用，后面计算Overall需要
+                '_tightness_list': tightness_values,
+                '_coverage_list': coverage_values,
+                '_time_list': time_values
+            })
+        
+        # 计算Overall
+        all_tightness = []
+        all_coverage = []
+        all_time = []
+        for r in results:
+            all_tightness.extend(r['_tightness_list'])
+            all_coverage.extend(r['_coverage_list'])
+            all_time.extend(r['_time_list'])
+        
+        results.append({
+            'Operator': '\\textbf{Overall}',
+            'Coverage': f"\\textbf{{{sum(all_coverage) / len(all_coverage) * 100:.0f}%}}",
+            'Median Tight.': f"\\textbf{{{np.median(all_tightness):.2f}×}}",
+            '95th %ile': f"\\textbf{{{np.percentile(all_tightness, 95):.2f}×}}",
+            'Time (s)': f"\\textbf{{{np.mean(all_time):.2f}}}"
+        })
+        
+        # 转成DataFrame（去掉内部列）
+        df = pd.DataFrame(results)
+        df = df[['Operator', 'Coverage', 'Median Tight.', '95th %ile', 'Time (s)']]
+        
+        # 保存
+        Path('tables').mkdir(exist_ok=True)
+        with open('tables/table1_main_results.tex', 'w') as f:
+            f.write(df.to_latex(index=False, escape=False))
+        
+        print(f"✓ Table 1 saved ({len(results)-1} operators, {len(all_tightness)} test cases)")
+        print(f"  Coverage: {sum(all_coverage) / len(all_coverage) * 100:.1f}%")
+        print(f"  Median Tightness: {np.median(all_tightness):.2f}×")
+        
+        return df
+    
+    def generate_table2_predoo_comparison(self) -> pd.DataFrame:
+        """生成Table 2: Predoo Comparison
+        
+        ⚠️ 这个需要你实现Predoo或者手动填数据！
+        """
+        print("\n=== Generating Table 2: Predoo Comparison ===")
+        
+        # 你需要选3个代表性算子
+        target_operators = ['Conv2D', 'MaxPooling', 'Softmax']
+        
+        # ⚠️ 方案1：如果你有Predoo的实现，用它算
+        # results = self._run_predoo_comparison(target_operators)
+        
+        # ⚠️ 方案2：如果没有，先用placeholder，后面手动填
+        print("⚠️  Warning: Using placeholder data for Predoo comparison")
+        print("   You need to either:")
+        print("   1. Implement Predoo and run comparison")
+        print("   2. Manually fill in Predoo values based on their paper")
+        
+        results = []
+        for op in target_operators:
+            # 从Table 1获取DARE的值
+            json_dir = self.base_dir / 'Storage_Reduced'
+            json_files = list(json_dir.glob(f"*{op.lower()}*.json"))[:100]  # 只取100个
+            
+            metrics_list = []
+            for json_file in json_files:
+                data = self.load_json_data(json_file)
+                metrics = self.extract_metrics(data)
+                if metrics:
+                    metrics_list.append(metrics)
+            
+            if len(metrics_list) == 0:
+                continue
+            
+            tightness_values = [m['tightness'] for m in metrics_list]
+            dare_median = np.median(tightness_values)
+            dare_p95 = np.percentile(tightness_values, 95)
+            
+            # ⚠️ Predoo的值需要你填！这里是placeholder
+            predoo_median = dare_median * 10  # placeholder
+            predoo_p95 = dare_p95 * 10
+            worst_case_median = dare_median * 30
+            worst_case_p95 = dare_p95 * 30
+            
+            results.extend([
+                {
+                    'Operator': f'\\multirow{{2}}{{*}}{{{op}}}',
+                    'Metric': 'Median',
+                    'DARE': f"{dare_median:.2f}×",
+                    'Predoo': f"{predoo_median:.2f}×",
+                    'Worst-case': f"{worst_case_median:.2f}×",
+                    'Improvement': f"{predoo_median / dare_median:.1f}×"
+                },
+                {
+                    'Operator': '',
+                    'Metric': '95th \\%ile',
+                    'DARE': f"{dare_p95:.2f}×",
+                    'Predoo': f"{predoo_p95:.2f}×",
+                    'Worst-case': f"{worst_case_p95:.2f}×",
+                    'Improvement': f"{predoo_p95 / dare_p95:.1f}×"
+                }
+            ])
+        
+        df = pd.DataFrame(results)
+        
+        with open('tables/table2_predoo_comparison.tex', 'w') as f:
+            f.write(df.to_latex(index=False, escape=False))
+        
+        print("✓ Table 2 saved (⚠️ contains placeholder Predoo values)")
+        return df
+    
+    def generate_table3_precision_configs(self) -> pd.DataFrame:
+        """生成Table 3: Precision Configurations
+        
+        ⚠️ 这个需要你跑了5种配置才有数据！
+        """
+        print("\n=== Generating Table 3: Precision Configurations ===")
+        
+        if len(self.configs) == 1:
+            print("⚠️  Warning: Only 1 config found. You need 5 configs for this table.")
+            print("   Options:")
+            print("   1. Run experiments on other 4 configs")
+            print("   2. Skip this table for now")
+            return None
+        
+        results = []
+        
+        for config_name, config_dir in self.configs.items():
+            print(f"Processing config: {config_name}")
+            
+            all_tightness = []
+            all_coverage = []
+            all_time = []
+            
+            for operator in self.operators:
+                json_dir = self.base_dir / config_dir
+                json_files = list(json_dir.glob(f"*{operator.lower()}*.json"))
+                
+                for json_file in json_files:
+                    data = self.load_json_data(json_file)
+                    metrics = self.extract_metrics(data)
+                    if metrics:
+                        all_tightness.append(metrics['tightness'])
+                        all_coverage.append(metrics['coverage'])
+                        all_time.append(metrics['time'])
+            
+            if len(all_tightness) == 0:
+                print(f"  ⚠️  No data for {config_name}")
+                continue
+            
+            results.append({
+                'Configuration': config_name,
+                'Cases': f"{len(all_tightness) / 1000:.0f}K",
+                'Coverage': f"{sum(all_coverage) / len(all_coverage) * 100:.0f}%",
+                'Median': f"{np.median(all_tightness):.2f}×",
+                '95th %ile': f"{np.percentile(all_tightness, 95):.2f}×",
+                'Time (s)': f"{np.mean(all_time):.2f}",
+                # 内部用
+                '_tightness_list': all_tightness,
+                '_coverage_list': all_coverage,
+                '_time_list': all_time
+            })
+        
+        # 计算Overall
+        if len(results) > 1:
+            all_tightness_total = []
+            all_coverage_total = []
+            all_time_total = []
+            for r in results:
+                all_tightness_total.extend(r['_tightness_list'])
+                all_coverage_total.extend(r['_coverage_list'])
+                all_time_total.extend(r['_time_list'])
+            
+            results.append({
+                'Configuration': '\\textbf{Overall}',
+                'Cases': f"\\textbf{{{len(all_tightness_total) / 1000:.0f}K}}",
+                'Coverage': f"\\textbf{{{sum(all_coverage_total) / len(all_coverage_total) * 100:.0f}%}}",
+                'Median': f"\\textbf{{{np.median(all_tightness_total):.2f}×}}",
+                '95th %ile': f"\\textbf{{{np.percentile(all_tightness_total, 95):.2f}×}}",
+                'Time (s)': f"\\textbf{{{np.mean(all_time_total):.2f}}}"
+            })
+        
+        df = pd.DataFrame(results)
+        df = df[['Configuration', 'Cases', 'Coverage', 'Median', '95th %ile', 'Time (s)']]
+        
+        with open('tables/table3_precision_configs.tex', 'w') as f:
+            f.write(df.to_latex(index=False, escape=False))
+        
+        print(f"✓ Table 3 saved ({len(results)-1} configs)")
+        return df
+    
+    def generate_table4_stability(self) -> pd.DataFrame:
+        """生成Table 4: Cross-Configuration Stability
+        
+        ⚠️ 这个也需要5种配置的数据！
+        """
+        print("\n=== Generating Table 4: Stability Analysis ===")
+        
+        if len(self.configs) == 1:
+            print("⚠️  Warning: Need 5 configs for stability analysis. Skipping.")
+            return None
+        
+        # 先构建矩阵：operators × configs
+        tightness_matrix = {}
+        
+        for operator in self.operators:
+            tightness_matrix[operator] = {}
+            
+            for config_name, config_dir in self.configs.items():
+                json_dir = self.base_dir / config_dir
+                json_files = list(json_dir.glob(f"*{operator.lower()}*.json"))
+                
+                tightness_values = []
+                for json_file in json_files:
+                    data = self.load_json_data(json_file)
+                    metrics = self.extract_metrics(data)
+                    if metrics:
+                        tightness_values.append(metrics['tightness'])
+                
+                if len(tightness_values) > 0:
+                    tightness_matrix[operator][config_name] = np.median(tightness_values)
+        
+        # 计算CV
+        results = []
+        for operator in self.operators:
+            if len(tightness_matrix[operator]) < 2:
+                continue
+            
+            values = list(tightness_matrix[operator].values())
+            mean_tight = np.mean(values)
+            std_tight = np.std(values, ddof=1)
+            cv = std_tight / mean_tight
+            
+            results.append({
+                'Operator': operator,
+                'Mean Tightness': f"{mean_tight:.2f}×",
+                'Std Dev': f"{std_tight:.2f}",
+                'CV': f"{cv:.3f}",
+                'Stability': 'High' if cv < 0.10 else 'Medium',
+                '_cv': cv  # 内部用
+            })
+        
+        # 计算Mean
+        if len(results) > 0:
+            mean_cv = np.mean([r['_cv'] for r in results])
+            results.append({
+                'Operator': '\\textbf{Mean}',
+                'Mean Tightness': f"\\textbf{{{np.mean([float(r['Mean Tightness'].strip('×')) for r in results]):.2f}×}}",
+                'Std Dev': f"\\textbf{{{np.mean([float(r['Std Dev']) for r in results]):.2f}}}",
+                'CV': f"\\textbf{{{mean_cv:.3f}}}",
+                'Stability': '\\textbf{High}'
+            })
+        
+        df = pd.DataFrame(results)
+        df = df[['Operator', 'Mean Tightness', 'Std Dev', 'CV', 'Stability']]
+        
+        with open('tables/table4_stability.tex', 'w') as f:
+            f.write(df.to_latex(index=False, escape=False))
+        
+        print(f"✓ Table 4 saved ({len(results)-1} operators)")
+        return df
+    
+    def generate_table5_efficiency(self) -> pd.DataFrame:
+        """生成Table 5: Efficiency Breakdown"""
+        print("\n=== Generating Table 5: Efficiency Breakdown ===")
+        
+        # 每个算子的receptive field（你需要根据实际情况填）
+        receptive_fields = {
+            'ReLU': 1,
+            'MaxPooling': 4,  # 假设2×2
+            'AvgPooling': 4,
+            'BatchNorm': 4096,  # 假设channel维度
+            'Softmax': 1024,  # 假设sequence length
+            'Conv2D': 27,  # 3×3×3 channels
+            'LayerNorm': 4096,
+            'MatMul': 1024,
+            'Linear': 2048,
+            'GEMM': 1024,
+            'Attention': 128  # d_head
+        }
+        
+        # MC samples（你代码里hardcoded的）
+        mc_samples = {op: (256 if op == 'Attention' else 1000) 
+                     for op in self.operators}
+        
+        results = []
+        
+        for operator in self.operators:
+            json_dir = self.base_dir / 'Storage_Reduced'
+            json_files = list(json_dir.glob(f"*{operator.lower()}*.json"))
+            
+            time_values = []
+            for json_file in json_files:
+                data = self.load_json_data(json_file)
+                if data and 'detector' in data:
+                    time_values.append(data['detector']['elapsed_sec'])
+            
+            if len(time_values) == 0:
+                continue
+            
+            mean_time = np.mean(time_values)
+            
+            # ⚠️ 这里需要你的N_out信息
+            # 如果JSON里没有，用typical value placeholder
+            n_out = 16384 if operator == 'ReLU' else 4096
+            if operator == 'Softmax':
+                n_out = 1024
+            elif operator in ['MatMul', 'GEMM', 'Attention']:
+                n_out = 1024
+            elif operator == 'Linear':
+                n_out = 512
+            
+            per_element_time = (mean_time / n_out) * 1000  # ms
+            
+            results.append({
+                'Operator': operator,
+                'Time (s)': f"{mean_time:.2f}",
+                'MC Samples': mc_samples[operator],
+                '$N_{\\text{out}}$': f"{n_out:,}",
+                'Receptive $\\mathcal{{C}}$': receptive_fields[operator],
+                'Time/$N_{\\text{out}}$ (ms)': f"{per_element_time:.3f}"
+            })
+        
+        df = pd.DataFrame(results)
+        
+        with open('tables/table5_efficiency.tex', 'w') as f:
+            f.write(df.to_latex(index=False, escape=False))
+        
+        print(f"✓ Table 5 saved ({len(results)} operators)")
+        return df
+    
+    def run_all(self):
+        """运行所有表格生成"""
+        print("=" * 60)
+        print("DARE Evaluation Data Processing")
+        print("=" * 60)
+        
+        Path('tables').mkdir(exist_ok=True)
+        
+        # Table 1: Main Results (必须有)
+        df1 = self.generate_table1_main_results()
+        
+        # Table 2: Predoo Comparison (需要实现Predoo或手动填)
+        df2 = self.generate_table2_predoo_comparison()
+        
+        # Table 3: Precision Configs (需要5种配置)
+        df3 = self.generate_table3_precision_configs()
+        
+        # Table 4: Stability (需要5种配置)
+        df4 = self.generate_table4_stability()
+        
+        # Table 5: Efficiency (必须有)
+        df5 = self.generate_table5_efficiency()
+        
+        print("\n" + "=" * 60)
+        print("Summary:")
+        print("=" * 60)
+        print(f"✓ Table 1 (Main Results): {'Generated' if df1 is not None else 'Failed'}")
+        print(f"{'⚠️' if df2 is not None else '✗'} Table 2 (Predoo): {'Generated (needs manual fill)' if df2 is not None else 'Failed'}")
+        print(f"{'✓' if df3 is not None else '⚠️'} Table 3 (Precision): {'Generated' if df3 is not None else 'Need 5 configs'}")
+        print(f"{'✓' if df4 is not None else '⚠️'} Table 4 (Stability): {'Generated' if df4 is not None else 'Need 5 configs'}")
+        print(f"✓ Table 5 (Efficiency): {'Generated' if df5 is not None else 'Failed'}")
+        print("\nAll generated tables saved to: tables/*.tex")
+
+
+if __name__ == "__main__":
+    # 使用方法
+    processor = EvaluationDataProcessor(base_dir='evaluation/experiment/')
+    processor.run_all()

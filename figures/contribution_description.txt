@@ -1,0 +1,18 @@
+
+Figure [X]: Error contribution breakdown by operator. 
+
+This stacked horizontal bar chart visualizes the sources of numerical error for each evaluated operator, sorted by total error magnitude (smallest at bottom, largest at top). Each bar is divided into colored segments representing different error sources, with segment width proportional to each component's absolute contribution. Values on segments show the magnitude in scientific notation. Solid bars represent positive error contributions (error sources), while hatched bars represent negative contributions (error cancellation effects).
+
+Key observations:
+- Conv2D: Dominated by Demote (5.86e-05), followed by Accum (5.31e-05).
+- GEMM: Dominated by Accum (2.59e-04), followed by Input (6.64e-05).
+- MatMul: Dominated by Accum (1.33e-04), followed by Demote (1.22e-04).
+- Attention: Dominated by Input (1.75e-04), followed by Weight (nan).
+- AvgPooling: Dominated by Input (nan), followed by Weight (nan).
+- MaxPooling: Dominated by Input (nan), followed by Weight (nan).
+- Linear: Dominated by Accum (2.60e-04), followed by Demote (nan).
+- LayerNorm: Dominated by Input (2.34e-03), followed by Weight (4.22e-04).
+- Softmax: Dominated by Input (6.83e-03), followed by Weight (nan).
+- BatchNorm: Dominated by Input (9.25e-03), followed by Weight (nan).
+
+The diversity of error profiles reflects distinct computational characteristics: storage-dominated operators (ReLU, Pooling) show errors primarily from quantization, arithmetic-heavy operators (Linear, MatMul, Conv2D) exhibit multiple error sources, and nonlinear operators (Softmax) demonstrate complex error interactions.

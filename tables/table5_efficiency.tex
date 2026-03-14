@@ -1,0 +1,17 @@
+\begin{tabular}{llrlrl}
+\toprule
+Operator & Time (s) & MC Samples & $N_{\text{out}}$ & Receptive $\mathcal{{C}}$ & Time/$N_{\text{out}}$ (ms) \\
+\midrule
+Conv2D & 3.03 & 1000 & 4,096 & 27 & 0.740 \\
+LayerNorm & 4.09 & 1000 & 4,096 & 4096 & 0.998 \\
+BatchNorm & 2.65 & 1000 & 4,096 & 4096 & 0.646 \\
+ReLU & 0.13 & 1000 & 16,384 & 1 & 0.008 \\
+Softmax & 2.81 & 1000 & 1,024 & 1024 & 2.742 \\
+AvgPooling & 2.23 & 1000 & 4,096 & 4 & 0.545 \\
+MaxPooling & 2.21 & 1000 & 4,096 & 4 & 0.540 \\
+Linear & 4.36 & 1000 & 512 & 2048 & 8.518 \\
+MatMul & 2.85 & 1000 & 1,024 & 1024 & 2.778 \\
+GEMM & 3.09 & 1000 & 1,024 & 1024 & 3.019 \\
+Attention & 3.34 & 256 & 1,024 & 128 & 3.258 \\
+\bottomrule
+\end{tabular}

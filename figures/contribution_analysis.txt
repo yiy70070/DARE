@@ -1,0 +1,49 @@
+3-COMPONENT ERROR DECOMPOSITION
+======================================================================
+
+Per-operator breakdown:
+
+• Conv2D:
+  ℓ:43.3% | a:27.0% | d:29.7%
+  Dominated by Storage (43.3%)
+
+• LayerNorm:
+  ℓ:82.9% | a:6.6% | d:10.5%
+  Dominated by Storage (82.9%)
+
+• BatchNorm:
+  ℓ:28.0% | a:46.1% | d:25.9%
+  Dominated by Accumulation (46.1%)
+
+• ReLU:
+  ℓ:nan% | a:nan% | d:nan%
+  Dominated by Storage (nan%)
+
+• Softmax:
+  ℓ:28.9% | a:53.2% | d:17.9%
+  Dominated by Accumulation (53.2%)
+
+• AvgPooling:
+  ℓ:23.4% | a:0.0% | d:76.6%
+  Dominated by Demotion (76.6%)
+
+• MaxPooling:
+  ℓ:28.9% | a:0.0% | d:71.1%
+  Dominated by Demotion (71.1%)
+
+• Linear:
+  ℓ:52.0% | a:25.1% | d:23.0%
+  Dominated by Storage (52.0%)
+
+• MatMul:
+  ℓ:43.8% | a:29.3% | d:26.9%
+  Dominated by Storage (43.8%)
+
+• GEMM:
+  ℓ:22.0% | a:68.3% | d:9.7%
+  Dominated by Accumulation (68.3%)
+
+• Attention:
+  ℓ:nan% | a:nan% | d:nan%
+  Dominated by Storage (nan%)
+

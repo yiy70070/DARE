@@ -1,0 +1,83 @@
+def diagnose_layernorm_issue(self):
+    """专门诊断LayerNorm的NaN问题"""
+    print("\n=== Diagnosing LayerNorm NaN Issue ===")
+    
+    for config_name, config_dirs in self.config_dirs.items():
+        print(f"\nConfig: {config_name}")
+        json_files = self.find_json_files('LayerNorm', config_dirs)
+        
+        if len(json_files) == 0:
+            continue
+        
+        print(f"  Found {len(json_files)} files")
+        
+        # 统计
+        total = 0
+        zero_actual_err = 0
+        zero_predicted = 0
+        tiny_actual_err = 0
+        inf_tightness = 0
+        nan_tightness = 0
+        huge_tightness = 0
+        valid = 0
+        
+        for json_file in json_files[:100]:  # 只看前100个
+            data = self.load_json_data(json_file)
+            if data is None or 'detector' not in data:
+                continue
+            
+            total += 1
+            detector = data['detector']
+            actual_err = detector.get('actual_err', 0)
+            predicted_bound = detector.get('predicted_bound', 0)
+            
+            # 诊断各种异常
+            if actual_err == 0:
+                zero_actual_err += 1
+                print(f"    Zero actual_err: {json_file.name}")
+                continue
+            
+            if predicted_bound == 0:
+                zero_predicted += 1
+                continue
+            
+            if actual_err < 1e-10:
+                tiny_actual_err += 1
+                print(f"    Tiny actual_err ({actual_err:.2e}): {json_file.name}")
+                continue
+            
+            tightness = predicted_bound / actual_err
+            
+            if np.isinf(tightness):
+                inf_tightness += 1
+                print(f"    Inf tightness: {json_file.name}")
+                continue
+            
+            if np.isnan(tightness):
+                nan_tightness += 1
+                print(f"    NaN tightness: {json_file.name}")
+                continue
+            
+            if tightness > 100:
+                huge_tightness += 1
+                print(f"    Huge tightness ({tightness:.1f}×): {json_file.name}")
+                print(f"      actual_err={actual_err:.2e}, predicted={predicted_bound:.2e}")
+                continue
+            
+            valid += 1
+        
+        # 报告
+        print(f"\n  Summary:")
+        print(f"    Total checked: {total}")
+        print(f"    Zero actual_err: {zero_actual_err}")
+        print(f"    Zero predicted: {zero_predicted}")
+        print(f"    Tiny actual_err (<1e-10): {tiny_actual_err}")
+        print(f"    Inf tightness: {inf_tightness}")
+        print(f"    NaN tightness: {nan_tightness}")
+        print(f"    Huge tightness (>100): {huge_tightness}")
+        print(f"    Valid: {valid}")
+        print(f"    Valid rate: {valid/total*100:.1f}%")
+
+# 在main里调用
+if __name__ == "__main__":
+    self.diagnose_layernorm_issue()

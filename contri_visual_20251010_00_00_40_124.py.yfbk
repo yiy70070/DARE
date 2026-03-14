@@ -1,0 +1,696 @@
+import json
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from pathlib import Path
+from typing import Dict, List, Tuple
+from collections import defaultdict
+
+class ContributionAnalyzer:
+    """分析每个算子的误差贡献来源"""
+    
+    def __init__(self):
+        # 你的实际数据路径
+        self.config_dirs = {
+            'Storage-Reduced': [
+                Path('evaluation/experiment'),
+                Path('evaluation/experiment_1')
+            ],
+            'FP32-Uniform': [
+                Path('evaluation/experiment_fp32')
+            ],
+            'FP16-Uniform': [
+                Path('evaluation/experiment_fp16_all')
+            ],
+            'FP16-Comp-FP32-Acc': [
+                Path('evaluation/experiment_fp16_compute_fp32_accum'),
+                Path('evaluation/experiment_fp16_compute_fp_32_accum')
+            ],
+            'BF16-Compute': [
+                Path('evaluation/experiment_bf16')
+            ]
+        }
+        
+        self.operators = ['Conv2D', 'LayerNorm', 'BatchNorm', 'Softmax', 
+                         'AvgPooling', 'MaxPooling', 'Linear', 'MatMul', 'GEMM', 'Attention']
+        
+        # 文件名映射
+        self.operator_filename_map = {
+            'AvgPooling': 'avg_pooling',
+            'MaxPooling': 'pooling',
+            'Conv2D': 'conv2d',
+            'LayerNorm': 'layernorm',
+            'BatchNorm': 'batchnorm',
+            #'ReLU': 'relu',
+            'Softmax': 'softmax',
+            'Linear': 'linear',
+            'MatMul': 'matmul',
+            'GEMM': 'gemm',
+            'Attention': 'attention'
+        }
+        
+        # 映射：原始字段 -> 四大阶段
+        self.stage_mapping = {
+            # Stage 1: Storage (Input precision reduction)
+            'input_storage_error': 'Storage',
+            'pooling_input_error': 'Storage',
+            
+            # Stage 2: Computation (Arithmetic operations)
+            'weight_storage_error': 'Compute',
+            'max_subtraction_error': 'Compute',
+            'exponential_error': 'Compute',
+            'mean_error': 'Compute',
+            'variance_error': 'Compute',
+            'normalization_error': 'Compute',
+            'statistics_computation_error': 'Compute',
+            'affine_params_error': 'Compute',
+            'scaling_error': 'Compute',
+            'matmul1_accumulation_error': 'Compute',
+            'bias_storage_error': 'Compute',
+            
+            # Stage 3: Accumulation
+            'accumulation_error': 'Accumulation',
+            'sum_accumulation_error': 'Accumulation',
+            'pooling_accum_error': 'Accumulation',
+            
+            # Stage 4: Demotion (Output precision reduction)
+            'output_storage_error': 'Demotion',
+            'demote_error': 'Demotion',
+            'pooling_demote_error': 'Demotion',
+        }
+        
+        # 四大阶段的显示名称
+        self.stage_names = {
+            'Storage': 'Storage',
+            'Compute': 'Compute',
+            'Accumulation': 'Accumulation',
+            'Demotion': 'Demotion',
+        }
+        
+        # 原始字段的详细名称（用于详细表格）
+        self.detailed_names = {
+            'input_storage_error': 'Input Storage',
+            'output_storage_error': 'Output Storage',
+            'weight_storage_error': 'Weight Storage',
+            'accumulation_error': 'Accumulation',
+            'demote_error': 'Demotion',
+            'bias_storage_error': 'Bias Storage',
+            'max_subtraction_error': 'Max Subtraction',
+            'exponential_error': 'Exponential',
+            'sum_accumulation_error': 'Sum Accumulation',
+            'pooling_input_error': 'Input Quantization',
+            'pooling_accum_error': 'Accumulation',
+            'pooling_demote_error': 'Demotion',
+            'statistics_computation_error': 'Statistics Computation',
+            'affine_params_error': 'Affine Parameters',
+            'scaling_error': 'Scaling',
+            'matmul1_accumulation_error': 'MatMul Accumulation',
+        }
+        
+        # 配色方案 - 4种颜色对应4个阶段
+        self.stage_colors = {
+            'Storage': '#e74c3c',      # 红色
+            'Compute': '#f39c12',      # 橙色
+            'Accumulation': '#27ae60', # 绿色
+            'Demotion': '#3498db',     # 蓝色
+        }
+    
+    def is_valid_number(self, value) -> bool:
+        """检查数值是否有效"""
+        if value is None:
+            return False
+        try:
+            value = float(value)
+            return np.isfinite(value) and not np.isnan(value)
+        except (ValueError, TypeError):
+            return False
+    
+    def find_json_files(self, operator: str, config_dirs: List[Path]) -> List[Path]:
+        """在多个目录中查找指定算子的JSON文件"""
+        filename = self.operator_filename_map.get(operator, operator.lower())
+        json_files = []
+        
+        for dir_path in config_dirs:
+            if not dir_path.exists():
+                continue
+            
+            pattern = f"*{filename}*.json"
+            found = list(dir_path.glob(pattern))
+            json_files.extend(found)
+            
+        print(f"    ✓ Found {len(json_files)} files for {operator}")
+        return json_files
+    
+    def load_json_data(self, json_file: Path) -> Dict:
+        """加载单个JSON文件"""
+        try:
+            with open(json_file, 'r') as f:
+                return json.load(f)
+        except Exception as e:
+            return None
+    
+    def extract_pooling_contributions(self, data: Dict) -> Dict:
+        """专门从Pooling的JSON提取contribution数据"""
+        try:
+            analyzer_report = data['analyzer_report']
+            actual_err = data['detector'].get('actual_err', 1.0)
+            
+            if not self.is_valid_number(actual_err) or actual_err == 0:
+                return None
+            
+            top_paths = analyzer_report.get('top_paths_summary', [])
+            
+            if not top_paths:
+                return None
+            
+            total_demote = 0.0
+            total_accum = 0.0
+            total_pixel_err = 0.0
+            num_paths = 0
+            
+            for path in top_paths:
+                pixel_error = path.get('pixel_error', 0)
+                demote_error_pixel = path.get('demote_error_pixel', 0)
+                accum_estimate = path.get('accum_estimate', 0)
+                
+                if self.is_valid_number(pixel_error) and pixel_error > 0:
+                    total_pixel_err += pixel_error
+                    if self.is_valid_number(demote_error_pixel):
+                        total_demote += demote_error_pixel
+                    if self.is_valid_number(accum_estimate):
+                        total_accum += accum_estimate
+                    num_paths += 1
+            
+            if num_paths == 0 or total_pixel_err == 0:
+                return None
+            
+            avg_pixel_err = total_pixel_err / num_paths
+            avg_demote = total_demote / num_paths
+            avg_accum = total_accum / num_paths
+            avg_input = max(0, avg_pixel_err - avg_demote - avg_accum)
+            
+            contributions = {
+                'pooling_input_error': (avg_input / actual_err) * 100,
+                'pooling_accum_error': (avg_accum / actual_err) * 100,
+                'pooling_demote_error': (avg_demote / actual_err) * 100,
+            }
+            
+            valid_contributions = {}
+            for key, value in contributions.items():
+                if self.is_valid_number(value) and value >= 0:
+                    valid_contributions[key] = value
+            
+            return valid_contributions if valid_contributions else None
+            
+        except Exception as e:
+            return None
+    
+    def extract_contributions(self, data: Dict, operator: str) -> Dict:
+        """从JSON提取contribution数据"""
+        if data is None:
+            return None
+        
+        try:
+            if 'analyzer_report' not in data:
+                return None
+            
+            analyzer_report = data['analyzer_report']
+            actual_err = data['detector'].get('actual_err', 1.0)
+            
+            if not self.is_valid_number(actual_err) or actual_err == 0:
+                return None
+            
+            # Pooling算子特殊处理
+            if operator in ['AvgPooling', 'MaxPooling']:
+                return self.extract_pooling_contributions(data)
+            
+            # 尝试多种数据源
+            if 'component_estimates' in analyzer_report:
+                component_estimates = analyzer_report['component_estimates']
+                
+                if component_estimates and len(component_estimates) > 0:
+                    valid_contributions = {}
+                    for key, value in component_estimates.items():
+                        if self.is_valid_number(value):
+                            percentage = (float(value) / actual_err) * 100
+                            valid_contributions[key] = percentage
+                    
+                    if valid_contributions:
+                        return valid_contributions
+            
+            if 'component_ratios' in analyzer_report:
+                component_ratios = analyzer_report['component_ratios']
+                
+                if component_ratios and len(component_ratios) > 0:
+                    valid_contributions = {}
+                    for key, value in component_ratios.items():
+                        if self.is_valid_number(value):
+                            valid_contributions[key] = float(value) * 100
+                    
+                    if valid_contributions:
+                        return valid_contributions
+            
+            if 'aggregated_contributions' in analyzer_report:
+                agg_contribs = analyzer_report['aggregated_contributions']
+                
+                if agg_contribs and len(agg_contribs) > 0:
+                    valid_contributions = {}
+                    for key, value in agg_contribs.items():
+                        if self.is_valid_number(value):
+                            percentage = (float(value) / actual_err) * 100
+                            valid_contributions[key] = percentage
+                    
+                    if valid_contributions:
+                        return valid_contributions
+            
+            if 'aggregated_ratios' in analyzer_report:
+                agg_ratios = analyzer_report['aggregated_ratios']
+                
+                if agg_ratios and len(agg_ratios) > 0:
+                    valid_contributions = {}
+                    for key, value in agg_ratios.items():
+                        if self.is_valid_number(value):
+                            valid_contributions[key] = float(value) * 100
+                    
+                    if valid_contributions:
+                        return valid_contributions
+            
+            return None
+            
+        except Exception as e:
+            return None
+    
+    def aggregate_contributions(self, operator: str, config_name: str = None) -> Tuple[Dict, Dict]:
+        """聚合单个算子的contribution平均值，返回(详细贡献, 四阶段贡献)"""
+        
+        if config_name:
+            config_dirs = self.config_dirs.get(config_name, [])
+        else:
+            config_dirs = []
+            for dirs in self.config_dirs.values():
+                config_dirs.extend(dirs)
+        
+        json_files = self.find_json_files(operator, config_dirs)
+        
+        if not json_files:
+            print(f"    ⚠️  No files found")
+            return {}, {}
+        
+        all_contributions = defaultdict(list)
+        files_with_data = 0
+        
+        for json_file in json_files:
+            data = self.load_json_data(json_file)
+            contributions = self.extract_contributions(data, operator)
+            
+            if contributions:
+                files_with_data += 1
+                for key, value in contributions.items():
+                    all_contributions[key].append(value)
+        
+        # 计算详细贡献的平均值
+        detailed_contributions = {}
+        for key, values in all_contributions.items():
+            if len(values) > 0:
+                detailed_contributions[key] = np.mean(values)
+        
+        if not detailed_contributions:
+            print(f"    ⚠️  No valid contribution data")
+            return {}, {}
+        
+        # 聚合到四大阶段
+        stage_contributions = defaultdict(float)
+        for key, value in detailed_contributions.items():
+            stage = self.stage_mapping.get(key, 'Compute')  # 默认归类到Compute
+            stage_contributions[stage] += value
+        
+        print(f"    ✓ {files_with_data}/{len(json_files)} files have valid data")
+        top_stages = sorted(stage_contributions.items(), key=lambda x: x[1], reverse=True)[:3]
+        top_str = ", ".join([f"{k}:{v:.1f}%" for k, v in top_stages])
+        print(f"      Stage breakdown: {top_str}")
+        
+        return detailed_contributions, dict(stage_contributions)
+    
+    def analyze_all_operators(self, config_name: str = None) -> Tuple[pd.DataFrame, pd.DataFrame]:
+        """分析所有算子，返回(详细DataFrame, 四阶段DataFrame)"""
+        print(f"\n{'='*70}")
+        print(f"Analyzing Error Contributions for All Operators")
+        if config_name:
+            print(f"Config: {config_name}")
+        else:
+            print(f"Config: All configs combined")
+        print(f"{'='*70}\n")
+        
+        detailed_results = []
+        stage_results = []
+        
+        for operator in self.operators:
+            print(f"\n{operator}:")
+            detailed_contribs, stage_contribs = self.aggregate_contributions(operator, config_name)
+            
+            if detailed_contribs:
+                row_detailed = {'operator': operator}
+                row_detailed.update(detailed_contribs)
+                detailed_results.append(row_detailed)
+                
+                row_stage = {'operator': operator}
+                row_stage.update(stage_contribs)
+                stage_results.append(row_stage)
+            else:
+                print(f"    ⚠️  Skipping {operator} (no data)")
+        
+        if not detailed_results:
+            print(f"\n❌ ERROR: No contribution data found!")
+            return pd.DataFrame(), pd.DataFrame()
+        
+        df_detailed = pd.DataFrame(detailed_results)
+        df_stage = pd.DataFrame(stage_results)
+        
+        # 确保四个阶段的列都存在
+        for stage in ['Storage', 'Compute', 'Accumulation', 'Demotion']:
+            if stage not in df_stage.columns:
+                df_stage[stage] = 0.0
+        
+        print(f"\n{'='*70}")
+        print(f"Summary: {len(df_stage)} operators analyzed successfully")
+        print(f"{'='*70}")
+        
+        return df_detailed, df_stage
+    
+    def plot_stacked_contributions(self, df: pd.DataFrame, save_path: str = 'figures/contribution_breakdown.pdf'):
+        """绘制四阶段的stacked bar chart，智能放置百分比标签"""
+        
+        if df.empty:
+            print(f"⚠️  Cannot plot: DataFrame is empty")
+            return
+        
+        print(f"\nGenerating 4-stage contribution breakdown plot...")
+        
+        # 四个阶段按固定顺序
+        stage_order = ['Storage', 'Compute', 'Accumulation', 'Demotion']
+        
+        # 计算总贡献用于排序
+        df_plot = df.copy()
+        df_plot['total'] = df_plot[stage_order].sum(axis=1)
+        df_plot = df_plot.sort_values('total', ascending=True)
+        
+        # 创建图表
+        fig, ax = plt.subplots(figsize=(18, 14))
+        
+        operators = df_plot['operator'].tolist()
+        y_pos = np.arange(len(operators))
+        
+        # 绘制stacked bars
+        left = np.zeros(len(operators))
+        
+        for stage in stage_order:
+            values = df_plot[stage].values
+            
+            if np.sum(values) > 0.01:
+                bars = ax.barh(y_pos, values, left=left, 
+                       label=self.stage_names[stage],
+                       color=self.stage_colors[stage],
+                       edgecolor='white', linewidth=1.5, height=0.7)
+                
+                # 智能放置百分比标签
+                for j, (bar, val) in enumerate(zip(bars, values)):
+                    if val > 3:  # 只标注>3%的部分
+                        width = bar.get_width()
+                        x_pos = left[j] + width/2
+                        y_bar = bar.get_y() + bar.get_height()/2
+                        
+                        # 根据bar宽度决定字体大小
+                        if val > 50:
+                            fontsize = 28
+                        elif val > 20:
+                            fontsize = 24
+                        elif val > 10:
+                            fontsize = 20
+                        else:
+                            fontsize = 18
+                        
+                        ax.text(x_pos, y_bar, f'{val:.0f}%',
+                               ha='center', va='center', 
+                               fontsize=fontsize, fontweight='bold', color='white',
+                               bbox=dict(boxstyle='round,pad=0.3', facecolor='black', alpha=0.3, edgecolor='none'))
+                
+                left += values
+        
+        # 设置坐标轴
+        ax.set_yticks(y_pos)
+        ax.set_yticklabels(operators, fontsize=33)
+        ax.set_xlabel('Contribution to Total Error (%)', fontsize=39, fontweight='bold')
+        
+        # 添加垂直线
+        ax.axvline(x=0, color='black', linewidth=3, linestyle='-', alpha=0.8)
+        
+        # 图例
+        ax.legend(loc='lower right', bbox_to_anchor=(1.0, 0.0),
+                 fontsize=30, frameon=True, fancybox=True, shadow=True,
+                 title='Error Sources (4 Stages)', title_fontsize=33)
+        
+        # 网格
+        ax.grid(True, alpha=0.3, axis='x', linestyle='--', linewidth=1.5)
+        ax.set_axisbelow(True)
+        
+        # X轴刻度
+        ax.tick_params(axis='x', labelsize=30)
+        
+        plt.tight_layout()
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        plt.close()
+        
+        print(f"✓ Figure saved to {save_path}")
+    
+    def generate_detailed_table(self, df_detailed: pd.DataFrame, df_stage: pd.DataFrame, 
+                               save_path: str = 'tables/contribution_detailed.tex'):
+        """生成详细的contribution表格，显示每个算子的Top 5误差源"""
+        
+        print(f"\nGenerating detailed contribution table...")
+        
+        table_rows = []
+        
+        for idx, row in df_detailed.iterrows():
+            operator = row['operator']
+            
+            # 获取所有贡献（除了operator列）
+            contribs = {k: v for k, v in row.items() if k != 'operator' and self.is_valid_number(v)}
+            
+            # 排序并取Top 5
+            sorted_contribs = sorted(contribs.items(), key=lambda x: abs(x[1]), reverse=True)[:5]
+            
+            # 构建表格行
+            contrib_strs = []
+            for source, value in sorted_contribs:
+                source_name = self.detailed_names.get(source, source)
+                stage = self.stage_mapping.get(source, 'Compute')
+                contrib_strs.append(f"{source_name} ({stage}): {value:.1f}\\%")
+            
+            table_rows.append({
+                'Operator': operator,
+                'Top 5 Error Sources': ' | '.join(contrib_strs)
+            })
+        
+        df_table = pd.DataFrame(table_rows)
+        
+        # 生成LaTeX
+        latex_str = df_table.to_latex(index=False, escape=False, 
+                                      column_format='l p{12cm}')
+        
+        caption = (
+            "\\caption{Top 5 error sources for each operator. "
+            "Each entry shows the error component name, its stage classification "
+            "(Storage/Compute/Accumulation/Demotion), and percentage contribution to total error.}\n"
+            "\\label{tab:contribution_detailed}\n"
+        )
+        
+        latex_str = latex_str.replace('\\begin{tabular}', caption + '\\begin{tabular}')
+        
+        with open(save_path, 'w') as f:
+            f.write(latex_str)
+        
+        print(f"✓ Detailed table saved to {save_path}")
+    
+    def generate_analysis_text(self, df_detailed: pd.DataFrame, df_stage: pd.DataFrame,
+                              save_path: str = 'figures/contribution_analysis.txt'):
+        """生成深入的文字分析"""
+        
+        print(f"\nGenerating detailed analysis text...")
+        
+        analysis = "="*70 + "\n"
+        analysis += "DETAILED ERROR CONTRIBUTION ANALYSIS\n"
+        analysis += "="*70 + "\n\n"
+        
+        analysis += "Figure [X]: Error contribution breakdown by computational stage.\n\n"
+        
+        analysis += """This visualization categorizes error sources into four stages following the mixed-precision computational pipeline:
+1. Storage (red): Input quantization errors from reduced precision storage
+2. Compute (orange): Arithmetic operation errors including weight quantization
+3. Accumulation (green): Error accumulation during repeated operations  
+4. Demotion (blue): Output quantization errors when reducing precision
+
+Key findings by operator:\n\n"""
+        
+        # 逐个算子分析
+        for idx, row in df_stage.iterrows():
+            operator = row['operator']
+            
+            # 获取四阶段的值
+            storage = row.get('Storage', 0)
+            compute = row.get('Compute', 0)
+            accumulation = row.get('Accumulation', 0)
+            demotion = row.get('Demotion', 0)
+            
+            total = storage + compute + accumulation + demotion
+            
+            # 找到最大的阶段
+            stages = {
+                'Storage': storage,
+                'Compute': compute,
+                'Accumulation': accumulation,
+                'Demotion': demotion
+            }
+            dominant_stage = max(stages.items(), key=lambda x: x[1])
+            
+            analysis += f"• {operator} (Total: {total:.0f}%):\n"
+            analysis += f"  - Dominated by {dominant_stage[0]} ({dominant_stage[1]:.0f}%)\n"
+            
+            # 找到详细的Top 3误差源
+            detailed_row = df_detailed[df_detailed['operator'] == operator].iloc[0]
+            contribs = {k: v for k, v in detailed_row.items() 
+                       if k != 'operator' and self.is_valid_number(v)}
+            top_3 = sorted(contribs.items(), key=lambda x: abs(x[1]), reverse=True)[:3]
+            
+            analysis += f"  - Top error sources:\n"
+            for source, value in top_3:
+                source_name = self.detailed_names.get(source, source)
+                stage = self.stage_mapping.get(source, 'Compute')
+                analysis += f"    * {source_name} ({stage}): {value:.1f}%\n"
+            
+            # 特定分析
+            if dominant_stage[0] == 'Demotion' and dominant_stage[1] > 30:
+                analysis += f"  ⚠ Scaling/demotion dominates error - consider higher output precision\n"
+            elif dominant_stage[0] == 'Storage' and dominant_stage[1] > 40:
+                analysis += f"  ⚠ Input storage is the bottleneck - consider FP16→FP32 promotion\n"
+            elif dominant_stage[0] == 'Accumulation' and dominant_stage[1] > 25:
+                analysis += f"  ⚠ Accumulation error significant - FP32 accumulation recommended\n"
+            
+            analysis += "\n"
+        
+        analysis += "\n" + "="*70 + "\n"
+        analysis += "CROSS-OPERATOR PATTERNS\n"
+        analysis += "="*70 + "\n\n"
+        
+        # 分析整体趋势
+        avg_storage = df_stage['Storage'].mean()
+        avg_compute = df_stage['Compute'].mean()
+        avg_accum = df_stage['Accumulation'].mean()
+        avg_demote = df_stage['Demotion'].mean()
+        
+        analysis += f"Average contributions across all operators:\n"
+        analysis += f"  - Storage: {avg_storage:.1f}%\n"
+        analysis += f"  - Compute: {avg_compute:.1f}%\n"
+        analysis += f"  - Accumulation: {avg_accum:.1f}%\n"
+        analysis += f"  - Demotion: {avg_demote:.1f}%\n\n"
+        
+        analysis += "Operator categories:\n\n"
+        
+        # Storage-dominated operators
+        storage_ops = df_stage[df_stage['Storage'] > 40]['operator'].tolist()
+        if storage_ops:
+            analysis += f"Storage-dominated ({len(storage_ops)}): {', '.join(storage_ops)}\n"
+            analysis += "  → Benefit most from higher input precision (FP16→FP32)\n\n"
+        
+        # Compute-dominated operators
+        compute_ops = df_stage[df_stage['Compute'] > 40]['operator'].tolist()
+        if compute_ops:
+            analysis += f"Compute-dominated ({len(compute_ops)}): {', '.join(compute_ops)}\n"
+            analysis += "  → Benefit from higher weight precision or better algorithms\n\n"
+        
+        # Accumulation-dominated operators
+        accum_ops = df_stage[df_stage['Accumulation'] > 25]['operator'].tolist()
+        if accum_ops:
+            analysis += f"Accumulation-sensitive ({len(accum_ops)}): {', '.join(accum_ops)}\n"
+            analysis += "  → Require FP32 accumulation for numerical stability\n\n"
+        
+        # Demotion-dominated operators
+        demote_ops = df_stage[df_stage['Demotion'] > 30]['operator'].tolist()
+        if demote_ops:
+            analysis += f"Demotion-dominated ({len(demote_ops)}): {', '.join(demote_ops)}\n"
+            analysis += "  → Benefit from delaying precision reduction or higher output precision\n\n"
+        
+        analysis += "\n" + "="*70 + "\n"
+        analysis += "OPTIMIZATION RECOMMENDATIONS\n"
+        analysis += "="*70 + "\n\n"
+        
+        analysis += """Based on the error contribution analysis, we recommend:
+
+1. For Storage-dominated operators (ReLU, simple activations):
+   - Use FP16 storage but promote to FP32 immediately for computation
+   - Consider keeping activations in FP32 if memory permits
+
+2. For Compute-dominated operators (Conv2D, MatMul, Linear):
+   - Maintain weight matrices in FP32 or use mixed-precision strategies
+   - Apply weight-specific quantization with per-channel scaling
+
+3. For Accumulation-sensitive operators (GEMM, large matmuls):
+   - Always use FP32 for accumulation, even if inputs/outputs are FP16
+   - Consider Kahan summation for critical paths
+
+4. For Demotion-dominated operators (normalization layers):
+   - Delay output quantization until after subsequent operations
+   - Use stochastic rounding instead of round-to-nearest
+
+5. Cross-cutting strategies:
+   - Profile each layer individually rather than applying uniform precision
+   - Use DARE's bounds to set layer-specific precision policies
+   - Monitor accumulation patterns in iterative algorithms
+"""
+        
+        with open(save_path, 'w') as f:
+            f.write(analysis)
+        
+        print(f"✓ Analysis saved to {save_path}")
+    
+    def run_full_analysis(self, config_name: str = None):
+        """运行完整分析流程"""
+        print("\n" + "="*70)
+        print("Starting Error Contribution Analysis (4-Stage Pipeline)")
+        print("="*70)
+        
+        Path('figures').mkdir(exist_ok=True)
+        Path('tables').mkdir(exist_ok=True)
+        Path('data').mkdir(exist_ok=True)
+        
+        # 分析数据
+        df_detailed, df_stage = self.analyze_all_operators(config_name)
+        
+        if df_stage.empty:
+            print("\n❌ Analysis failed: No valid data found!")
+            return
+        
+        # 保存原始数据
+        df_detailed.to_csv('data/contribution_detailed.csv', index=False)
+        df_stage.to_csv('data/contribution_4stage.csv', index=False)
+        print(f"\n✓ Raw data saved to data/")
+        
+        # 生成图表（4阶段）
+        self.plot_stacked_contributions(df_stage, 'figures/contribution_breakdown.pdf')
+        
+        # 生成详细表格
+        self.generate_detailed_table(df_detailed, df_stage, 'tables/contribution_detailed.tex')
+        
+        # 生成文字分析
+        self.generate_analysis_text(df_detailed, df_stage, 'figures/contribution_analysis.txt')
+        
+        print("\n" + "="*70)
+        print("Analysis Complete!")
+        print("="*70)
+        print("\nGenerated files:")
+        print("  Data:    data/contribution_detailed.csv")
+        print("           data/contribution_4stage.csv")
+
+# 使用示例
+if __name__ == "__main__":
+    analyzer = ContributionAnalyzer()
+    analyzer.run_full_analysis()

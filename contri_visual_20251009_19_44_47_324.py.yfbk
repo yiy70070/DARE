@@ -1,0 +1,450 @@
+import json
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from pathlib import Path
+from typing import Dict, List, Tuple
+from collections import defaultdict
+
+class ContributionAnalyzer:
+    """分析每个算子的误差贡献来源"""
+    
+    def __init__(self):
+        # 你的实际数据路径
+        self.config_dirs = {
+            'Storage-Reduced': [
+                Path('evaluation/experiment'),
+                Path('evaluation/experiment_1')
+            ],
+            'FP32-Uniform': [
+                Path('evaluation/experiment_fp32')
+            ],
+            'FP16-Uniform': [
+                Path('evaluation/experiment_fp16_all')
+            ],
+            'FP16-Comp-FP32-Acc': [
+                Path('evaluation/experiment_fp16_compute_fp32_accum'),
+                Path('evaluation/experiment_fp16_compute_fp_32_accum')
+            ],
+            'BF16-Compute': [
+                Path('evaluation/experiment_bf16')
+            ]
+        }
+        
+        self.operators = ['Conv2D', 'LayerNorm', 'BatchNorm', 'ReLU', 'Softmax', 
+                         'AvgPooling', 'MaxPooling', 'Linear', 'MatMul', 'GEMM', 'Attention']
+        
+        # 文件名映射
+        self.operator_filename_map = {
+            'AvgPooling': 'avg_pooling',
+            'MaxPooling': 'pooling',
+            'Conv2D': 'conv2d',
+            'LayerNorm': 'layernorm',
+            'BatchNorm': 'batchnorm',
+            #'ReLU': 'relu',
+            'Softmax': 'softmax',
+            'Linear': 'linear',
+            'MatMul': 'matmul',
+            'GEMM': 'gemm',
+            'Attention': 'attention'
+        }
+        
+        # Contribution因素的显示名称（基于你的JSON结构）
+        self.contribution_names = {
+            # Common across operators
+            'input_storage_error': 'Input Storage',
+            'output_storage_error': 'Output Storage',
+            
+            # Linear/MatMul/GEMM specific
+            'weight_storage_error': 'Weight Storage',
+            'accumulation_error': 'Accumulation',
+            'demote_error': 'Demotion',
+            'bias_storage_error': 'Bias Storage',
+            
+            # Softmax specific
+            'max_subtraction_error': 'Max Subtraction',
+            'exponential_error': 'Exponential',
+            'sum_accumulation_error': 'Sum Accumulation',
+            
+            # Normalization specific
+            'mean_error': 'Mean Calc',
+            'variance_error': 'Variance Calc',
+            'normalization_error': 'Normalization',
+            
+            # Convolution specific
+            'kernel_error': 'Kernel',
+            'spatial_error': 'Spatial',
+        }
+        
+        # 配色方案
+        self.positive_colors = ['#e74c3c', '#e67e22', '#f39c12', '#27ae60', '#3498db', '#9b59b6', '#34495e', '#95a5a6']
+        self.negative_colors = ['#c0392b', '#d35400', '#e67e22', '#229954', '#2874a6', '#7d3c98', '#2c3e50', '#7f8c8d']
+    
+    def is_valid_number(self, value) -> bool:
+        """检查数值是否有效"""
+        if value is None:
+            return False
+        try:
+            value = float(value)
+            return np.isfinite(value) and not np.isnan(value)
+        except (ValueError, TypeError):
+            return False
+    
+    def find_json_files(self, operator: str, config_dirs: List[Path]) -> List[Path]:
+        """在多个目录中查找指定算子的JSON文件"""
+        filename = self.operator_filename_map.get(operator, operator.lower())
+        json_files = []
+        
+        for dir_path in config_dirs:
+            if not dir_path.exists():
+                continue
+            
+            pattern = f"*{filename}*.json"
+            found = list(dir_path.glob(pattern))
+            json_files.extend(found)
+            
+        print(f"    ✓ Found {len(json_files)} files for {operator}")
+        return json_files
+    
+    def load_json_data(self, json_file: Path) -> Dict:
+        """加载单个JSON文件"""
+        try:
+            with open(json_file, 'r') as f:
+                return json.load(f)
+        except Exception as e:
+            return None
+    
+    def extract_contributions(self, data: Dict) -> Dict:
+        """从JSON提取contribution数据 - 适配你的实际结构"""
+        if data is None:
+            return None
+        
+        try:
+            # 从 analyzer_report.component_estimates 提取
+            if 'analyzer_report' not in data:
+                return None
+            
+            analyzer_report = data['analyzer_report']
+            
+            # 优先使用 component_estimates
+            if 'component_estimates' in analyzer_report:
+                component_estimates = analyzer_report['component_estimates']
+                
+                # 过滤掉无效数据，转换为百分比（相对于actual_err）
+                actual_err = data['detector'].get('actual_err', 1.0)
+                
+                if not self.is_valid_number(actual_err) or actual_err == 0:
+                    return None
+                
+                valid_contributions = {}
+                for key, value in component_estimates.items():
+                    if self.is_valid_number(value):
+                        # 转换为相对百分比
+                        percentage = (float(value) / actual_err) * 100
+                        valid_contributions[key] = percentage
+                
+                return valid_contributions if valid_contributions else None
+            
+            # 备选：使用 component_ratios（已经是百分比形式）
+            elif 'component_ratios' in analyzer_report:
+                component_ratios = analyzer_report['component_ratios']
+                
+                valid_contributions = {}
+                for key, value in component_ratios.items():
+                    if self.is_valid_number(value):
+                        # 已经是比例，转换为百分比
+                        valid_contributions[key] = float(value) * 100
+                
+                return valid_contributions if valid_contributions else None
+            
+            return None
+            
+        except Exception as e:
+            return None
+    
+    def aggregate_contributions(self, operator: str, config_name: str = None) -> Dict:
+        """聚合单个算子的contribution平均值"""
+        
+        # 确定要扫描的目录
+        if config_name:
+            config_dirs = self.config_dirs.get(config_name, [])
+        else:
+            config_dirs = []
+            for dirs in self.config_dirs.values():
+                config_dirs.extend(dirs)
+        
+        json_files = self.find_json_files(operator, config_dirs)
+        
+        if not json_files:
+            return {}
+        
+        # 存储所有valid contributions
+        all_contributions = defaultdict(list)
+        files_with_data = 0
+        
+        for json_file in json_files:
+            data = self.load_json_data(json_file)
+            contributions = self.extract_contributions(data)
+            
+            if contributions:
+                files_with_data += 1
+                for key, value in contributions.items():
+                    all_contributions[key].append(value)
+        
+        # 计算平均值
+        avg_contributions = {}
+        for key, values in all_contributions.items():
+            if len(values) > 0:
+                avg_contributions[key] = np.mean(values)
+        
+        # 报告统计信息
+        if files_with_data > 0:
+            print(f"    ✓ {files_with_data}/{len(json_files)} files have valid data")
+            if avg_contributions:
+                # 显示前3个贡献因素
+                top_3 = sorted(avg_contributions.items(), key=lambda x: abs(x[1]), reverse=True)[:3]
+                top_3_str = ", ".join([f"{k}:{v:.1f}%" for k, v in top_3])
+                print(f"      Top contributors: {top_3_str}")
+        else:
+            print(f"    ⚠️  No contribution data found")
+        
+        return avg_contributions
+    
+    def analyze_all_operators(self, config_name: str = None) -> pd.DataFrame:
+        """分析所有算子的contribution"""
+        print(f"\n{'='*70}")
+        print(f"Analyzing Error Contributions for All Operators")
+        if config_name:
+            print(f"Config: {config_name}")
+        else:
+            print(f"Config: All configs combined")
+        print(f"{'='*70}\n")
+        
+        results = []
+        
+        for operator in self.operators:
+            print(f"\n{operator}:")
+            contributions = self.aggregate_contributions(operator, config_name)
+            
+            if contributions:
+                row = {'operator': operator}
+                row.update(contributions)
+                results.append(row)
+        
+        if not results:
+            print(f"\n❌ ERROR: No contribution data found!")
+            return pd.DataFrame()
+        
+        df = pd.DataFrame(results)
+        
+        print(f"\n{'='*70}")
+        print(f"Summary: {len(df)} operators analyzed successfully")
+        print(f"{'='*70}")
+        
+        return df
+    
+    def plot_stacked_contributions(self, df: pd.DataFrame, save_path: str = 'figures/contribution_breakdown.pdf'):
+        """绘制stacked bar chart，按贡献大小排序"""
+        
+        if df.empty:
+            print(f"⚠️  Cannot plot: DataFrame is empty")
+            return
+        
+        print(f"\nGenerating contribution breakdown plot...")
+        
+        # 提取contribution列
+        contrib_cols = [col for col in df.columns if col != 'operator']
+        
+        if not contrib_cols:
+            print(f"⚠️  No contribution columns found")
+            return
+        
+        # 计算总贡献（绝对值）用于排序
+        df_plot = df.copy()
+        df_plot['total_abs'] = df_plot[contrib_cols].abs().sum(axis=1)
+        df_plot = df_plot.sort_values('total_abs', ascending=True)
+        
+        # 分离正负贡献
+        df_positive = df_plot[['operator'] + contrib_cols].copy()
+        df_negative = df_plot[['operator'] + contrib_cols].copy()
+        
+        for col in contrib_cols:
+            df_positive[col] = df_positive[col].apply(lambda x: x if x > 0 else 0)
+            df_negative[col] = df_negative[col].apply(lambda x: x if x < 0 else 0)
+        
+        # 创建图表
+        fig, ax = plt.subplots(figsize=(14, 10))
+        
+        operators = df_plot['operator'].tolist()
+        y_pos = np.arange(len(operators))
+        
+        # 只绘制非零贡献
+        active_cols = [col for col in contrib_cols 
+                      if (df_positive[col].sum() > 0.01 or df_negative[col].sum() < -0.01)]
+        
+        # 绘制正贡献
+        left_positive = np.zeros(len(operators))
+        legend_added = set()
+        
+        for i, col in enumerate(active_cols):
+            values_pos = df_positive[col].values
+            if np.sum(np.abs(values_pos)) > 0.01:
+                label = self.contribution_names.get(col, col)
+                ax.barh(y_pos, values_pos, left=left_positive, 
+                       label=label,
+                       color=self.positive_colors[i % len(self.positive_colors)],
+                       edgecolor='white', linewidth=0.8)
+                left_positive += values_pos
+                legend_added.add(label)
+        
+        # 绘制负贡献
+        left_negative = np.zeros(len(operators))
+        for i, col in enumerate(active_cols):
+            values_neg = df_negative[col].values
+            if np.sum(np.abs(values_neg)) > 0.01:
+                label = self.contribution_names.get(col, col)
+                if label not in legend_added:
+                    ax.barh(y_pos, values_neg, left=left_negative,
+                           label=label,
+                           color=self.negative_colors[i % len(self.negative_colors)],
+                           alpha=0.7, edgecolor='white', linewidth=0.8,
+                           hatch='//')
+                else:
+                    ax.barh(y_pos, values_neg, left=left_negative,
+                           color=self.negative_colors[i % len(self.negative_colors)],
+                           alpha=0.7, edgecolor='white', linewidth=0.8,
+                           hatch='//')
+                left_negative += values_neg
+        
+        # 设置坐标轴
+        ax.set_yticks(y_pos)
+        ax.set_yticklabels(operators, fontsize=11)
+        ax.set_xlabel('Contribution to Total Error (%)', fontsize=13, fontweight='bold')
+        ax.set_title('Error Source Breakdown by Operator\n(sorted by total contribution magnitude)', 
+                    fontsize=14, fontweight='bold', pad=20)
+        
+        # 添加垂直线
+        ax.axvline(x=0, color='black', linewidth=2, linestyle='-', alpha=0.8)
+        
+        # 图例
+        handles, labels = ax.get_legend_handles_labels()
+        by_label = dict(zip(labels, handles))
+        ax.legend(by_label.values(), by_label.keys(), 
+                 loc='lower right', bbox_to_anchor=(1.0, 0.0),
+                 fontsize=10, frameon=True, fancybox=True, shadow=True,
+                 title='Error Sources', title_fontsize=11)
+        
+        # 网格
+        ax.grid(True, alpha=0.3, axis='x', linestyle='--', linewidth=0.5)
+        ax.set_axisbelow(True)
+        
+        # 添加说明文字
+        ax.text(0.02, 0.98, 'Solid bars: positive contribution | Hatched bars: negative contribution (error cancellation)',
+                transform=ax.transAxes, fontsize=9, verticalalignment='top',
+                bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.3))
+        
+        plt.tight_layout()
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        plt.close()
+        
+        print(f"✓ Figure saved to {save_path}")
+    
+    def generate_contribution_table(self, df: pd.DataFrame, save_path: str = 'tables/contribution_breakdown.tex'):
+        """生成LaTeX表格"""
+        
+        if df.empty:
+            print(f"⚠️  Cannot generate table: DataFrame is empty")
+            return
+        
+        print(f"\nGenerating contribution table...")
+        
+        # 提取contribution列
+        contrib_cols = [col for col in df.columns if col != 'operator']
+        
+        # 计算总贡献
+        df_table = df.copy()
+        df_table['total_abs'] = df_table[contrib_cols].abs().sum(axis=1)
+        
+        # 只保留有显著贡献的列（至少有一个算子>1%）
+        significant_cols = [col for col in contrib_cols 
+                           if df_table[col].abs().max() > 1.0]
+        
+        # 格式化数据
+        df_export = df_table[['operator'] + significant_cols + ['total_abs']].copy()
+        
+        for col in significant_cols:
+            df_export[col] = df_export[col].apply(lambda x: f"{x:+.1f}\\%")
+        
+        df_export['total_abs'] = df_export['total_abs'].apply(lambda x: f"{x:.1f}\\%")
+        
+        # 重命名列
+        rename_map = {'operator': 'Operator', 'total_abs': 'Total'}
+        rename_map.update({k: self.contribution_names.get(k, k) for k in significant_cols})
+        df_export = df_export.rename(columns=rename_map)
+        
+        # 生成LaTeX
+        latex_str = df_export.to_latex(index=False, escape=False, 
+                                       column_format='l' + 'r'*(len(df_export.columns)-1))
+        
+        # 添加表格说明
+        caption = (
+            "\\caption{Error contribution breakdown for each operator. "
+            "Values show each component's relative contribution to total error. "
+            "Positive values indicate error sources, negative values indicate error cancellation.}\n"
+            "\\label{tab:contribution_breakdown}\n"
+        )
+        
+        latex_str = latex_str.replace('\\begin{tabular}', caption + '\\begin{tabular}')
+        
+        with open(save_path, 'w') as f:
+            f.write(latex_str)
+        
+        print(f"✓ Table saved to {save_path}")
+    
+    def run_full_analysis(self, config_name: str = None):
+        """运行完整分析流程"""
+        print("\n" + "="*70)
+        print("Starting Error Contribution Analysis")
+        print("="*70)
+        
+        # 创建输出目录
+        Path('figures').mkdir(exist_ok=True)
+        Path('tables').mkdir(exist_ok=True)
+        Path('data').mkdir(exist_ok=True)
+        
+        # 分析数据
+        df = self.analyze_all_operators(config_name)
+        
+        if df.empty:
+            print("\n❌ Analysis failed: No valid data found!")
+            return
+        
+        # 保存原始数据
+        csv_path = 'data/contribution_breakdown.csv'
+        df.to_csv(csv_path, index=False)
+        print(f"\n✓ Raw data saved to {csv_path}")
+        
+        # 生成图表
+        self.plot_stacked_contributions(df, 'figures/contribution_breakdown.pdf')
+        
+        # 生成表格
+        self.generate_contribution_table(df, 'tables/contribution_breakdown.tex')
+        
+        print("\n" + "="*70)
+        print("Analysis Complete!")
+        print("="*70)
+        print("\nGenerated files:")
+        print("  Data:    data/contribution_breakdown.csv")
+        print("  Figure:  figures/contribution_breakdown.pdf")
+        print("  Table:   tables/contribution_breakdown.tex")
+
+
+# 使用示例
+if __name__ == "__main__":
+    analyzer = ContributionAnalyzer()
+    
+    # 分析所有configs的平均值
+    analyzer.run_full_analysis()
+    
+    # 或者只分析特定config
+    # analyzer.run_full_analysis(config_name='Storage-Reduced')

@@ -1,0 +1,289 @@
+import json
+import numpy as np
+from pathlib import Path
+
+def find_json_files(operator_name, base_dirs):
+    """在多个目录中查找JSON文件"""
+    # 文件名映射
+    filename_map = {
+        'LayerNorm': 'layernorm',
+        'layer_norm': 'layernorm'  # 可能的变体
+    }
+    
+    filename = filename_map.get(operator_name, operator_name.lower())
+    json_files = []
+    
+    for base_dir in base_dirs:
+        dir_path = Path(base_dir)
+        if not dir_path.exists():
+            print(f"  ⚠️  Directory not found: {dir_path}")
+            continue
+        
+        pattern = f"*{filename}*.json"
+        found = list(dir_path.glob(pattern))
+        json_files.extend(found)
+        print(f"  Found {len(found)} files in {dir_path}")
+    
+    return json_files
+
+def diagnose_layernorm():
+    """诊断LayerNorm的NaN问题"""
+    print("=" * 70)
+    print("Diagnosing LayerNorm NaN Issue")
+    print("=" * 70)
+    
+    # 所有可能的目录
+    all_dirs = [
+        'evaluation/experiment',
+        'evaluation/experiment_1',
+        'evaluation/experiment_fp32',
+        'evaluation/experiment_fp16_all',
+        'evaluation/experiment_fp16_compute_fp32_accum',
+        'evaluation/experiment_fp16_compute_fp_32_accum',
+        'evaluation/experiment_bf16'
+    ]
+    
+    print("\nSearching for LayerNorm files...")
+    json_files = find_json_files('LayerNorm', all_dirs)
+    
+    if len(json_files) == 0:
+        print("\n❌ No LayerNorm files found!")
+        print("Possible reasons:")
+        print("  1. File naming is different (try: layer_norm, LayerNorm, etc.)")
+        print("  2. Wrong directories")
+        print("\nTrying to list all JSON files in first directory...")
+        first_dir = Path(all_dirs[0])
+        if first_dir.exists():
+            all_jsons = list(first_dir.glob("*.json"))
+            print(f"  Found {len(all_jsons)} total JSON files")
+            if len(all_jsons) > 0:
+                print("  Sample filenames:")
+                for f in list(all_jsons)[:5]:
+                    print(f"    - {f.name}")
+        return
+    
+    print(f"\n✓ Found {len(json_files)} LayerNorm files total")
+    print(f"Analyzing first 100 files...\n")
+    
+    # 统计信息
+    stats = {
+        'total': 0,
+        'zero_actual_err': [],
+        'zero_predicted': [],
+        'tiny_actual_err': [],
+        'negative_actual_err': [],
+        'inf_tightness': [],
+        'nan_tightness': [],
+        'huge_tightness': [],
+        'valid': [],
+        'coverage_violation': []
+    }
+    
+    # 分析前100个文件
+    for json_file in json_files[:100]:
+        try:
+            with open(json_file, 'r') as f:
+                data = json.load(f)
+        except Exception as e:
+            print(f"  ⚠️  Error loading {json_file.name}: {e}")
+            continue
+        
+        if 'detector' not in data:
+            print(f"  ⚠️  No 'detector' key in {json_file.name}")
+            continue
+        
+        stats['total'] += 1
+        detector = data['detector']
+        actual_err = detector.get('actual_err', 0)
+        predicted_bound = detector.get('predicted_bound', 0)
+        
+        # 检查各种异常情况
+        if actual_err == 0:
+            stats['zero_actual_err'].append({
+                'file': json_file.name,
+                'predicted': predicted_bound
+            })
+            continue
+        
+        if actual_err < 0:
+            stats['negative_actual_err'].append({
+                'file': json_file.name,
+                'actual': actual_err,
+                'predicted': predicted_bound
+            })
+            continue
+        
+        if predicted_bound == 0:
+            stats['zero_predicted'].append({
+                'file': json_file.name,
+                'actual': actual_err
+            })
+            continue
+        
+        if actual_err < 1e-10:
+            stats['tiny_actual_err'].append({
+                'file': json_file.name,
+                'actual': actual_err,
+                'predicted': predicted_bound
+            })
+            continue
+        
+        # 计算tightness
+        tightness = predicted_bound / actual_err
+        
+        if np.isinf(tightness):
+            stats['inf_tightness'].append({
+                'file': json_file.name,
+                'actual': actual_err,
+                'predicted': predicted_bound
+            })
+            continue
+        
+        if np.isnan(tightness):
+            stats['nan_tightness'].append({
+                'file': json_file.name,
+                'actual': actual_err,
+                'predicted': predicted_bound
+            })
+            continue
+        
+        if tightness > 100:
+            stats['huge_tightness'].append({
+                'file': json_file.name,
+                'actual': actual_err,
+                'predicted': predicted_bound,
+                'tightness': tightness
+            })
+            continue
+        
+        # 检查coverage violation
+        if predicted_bound < actual_err:
+            stats['coverage_violation'].append({
+                'file': json_file.name,
+                'actual': actual_err,
+                'predicted': predicted_bound,
+                'ratio': actual_err / predicted_bound
+            })
+        
+        # Valid case
+        stats['valid'].append({
+            'file': json_file.name,
+            'actual': actual_err,
+            'predicted': predicted_bound,
+            'tightness': tightness
+        })
+    
+    # 打印报告
+    print("=" * 70)
+    print("DIAGNOSIS REPORT")
+    print("=" * 70)
+    
+    total = stats['total']
+    print(f"\nTotal files analyzed: {total}")
+    
+    if total == 0:
+        print("❌ No valid data to analyze!")
+        return
+    
+    print(f"\n{'Category':<30} {'Count':<10} {'%':<10}")
+    print("-" * 70)
+    
+    for key in ['zero_actual_err', 'negative_actual_err', 'zero_predicted', 
+                'tiny_actual_err', 'inf_tightness', 'nan_tightness', 
+                'huge_tightness', 'coverage_violation', 'valid']:
+        count = len(stats[key])
+        pct = count / total * 100 if total > 0 else 0
+        print(f"{key:<30} {count:<10} {pct:>6.1f}%")
+    
+    # 详细信息
+    print("\n" + "=" * 70)
+    print("DETAILED ISSUES")
+    print("=" * 70)
+    
+    if len(stats['zero_actual_err']) > 0:
+        print(f"\n🔴 Zero actual_err ({len(stats['zero_actual_err'])} cases):")
+        for item in stats['zero_actual_err'][:3]:
+            print(f"  - {item['file']}")
+            print(f"    predicted_bound = {item['predicted']:.6e}")
+    
+    if len(stats['negative_actual_err']) > 0:
+        print(f"\n🔴 Negative actual_err ({len(stats['negative_actual_err'])} cases):")
+        for item in stats['negative_actual_err'][:3]:
+            print(f"  - {item['file']}")
+            print(f"    actual_err = {item['actual']:.6e}")
+    
+    if len(stats['tiny_actual_err']) > 0:
+        print(f"\n🟡 Tiny actual_err (<1e-10) ({len(stats['tiny_actual_err'])} cases):")
+        for item in stats['tiny_actual_err'][:3]:
+            print(f"  - {item['file']}")
+            print(f"    actual_err = {item['actual']:.6e}")
+            print(f"    predicted = {item['predicted']:.6e}")
+            if item['actual'] > 0:
+                print(f"    tightness = {item['predicted'] / item['actual']:.2f}×")
+    
+    if len(stats['huge_tightness']) > 0:
+        print(f"\n🟡 Huge tightness (>100×) ({len(stats['huge_tightness'])} cases):")
+        for item in stats['huge_tightness'][:3]:
+            print(f"  - {item['file']}")
+            print(f"    actual_err = {item['actual']:.6e}")
+            print(f"    predicted = {item['predicted']:.6e}")
+            print(f"    tightness = {item['tightness']:.2f}×")
+    
+    if len(stats['nan_tightness']) > 0:
+        print(f"\n🔴 NaN tightness ({len(stats['nan_tightness'])} cases):")
+        for item in stats['nan_tightness'][:3]:
+            print(f"  - {item['file']}")
+            print(f"    actual_err = {item['actual']}")
+            print(f"    predicted = {item['predicted']}")
+    
+    if len(stats['inf_tightness']) > 0:
+        print(f"\n🔴 Inf tightness ({len(stats['inf_tightness'])} cases):")
+        for item in stats['inf_tightness'][:3]:
+            print(f"  - {item['file']}")
+            print(f"    actual_err = {item['actual']:.6e}")
+            print(f"    predicted = {item['predicted']:.6e}")
+    
+    if len(stats['coverage_violation']) > 0:
+        print(f"\n🔴 Coverage violations ({len(stats['coverage_violation'])} cases):")
+        for item in stats['coverage_violation'][:3]:
+            print(f"  - {item['file']}")
+            print(f"    actual_err = {item['actual']:.6e}")
+            print(f"    predicted = {item['predicted']:.6e}")
+            print(f"    ratio (actual/predicted) = {item['ratio']:.2f}×")
+    
+    if len(stats['valid']) > 0:
+        print(f"\n✅ Valid cases ({len(stats['valid'])} cases):")
+        tightness_values = [item['tightness'] for item in stats['valid']]
+        print(f"  Median tightness: {np.median(tightness_values):.2f}×")
+        print(f"  95th percentile: {np.percentile(tightness_values, 95):.2f}×")
+        print(f"  Min: {np.min(tightness_values):.2f}×")
+        print(f"  Max: {np.max(tightness_values):.2f}×")
+    
+    # 推荐过滤策略
+    print("\n" + "=" * 70)
+    print("RECOMMENDED FILTERING STRATEGY")
+    print("=" * 70)
+    
+    issues = []
+    if len(stats['zero_actual_err']) > 0:
+        issues.append("Filter: actual_err == 0")
+    if len(stats['negative_actual_err']) > 0:
+        issues.append("Filter: actual_err < 0 (BUG!)")
+    if len(stats['tiny_actual_err']) > 0:
+        pct = len(stats['tiny_actual_err']) / total * 100
+        threshold = 1e-10 if pct < 10 else 1e-9
+        issues.append(f"Filter: actual_err < {threshold:.0e} ({pct:.1f}% affected)")
+    if len(stats['huge_tightness']) > 0:
+        issues.append("Filter: tightness > 100")
+    
+    if len(issues) > 0:
+        print("\nSuggested filters in extract_metrics():")
+        for issue in issues:
+            print(f"  - {issue}")
+    else:
+        print("\n✅ Data looks clean! No filtering needed.")
+    
+    print("\n" + "=" * 70)
+
+if __name__ == "__main__":
+    diagnose_layernorm()

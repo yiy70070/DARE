@@ -1,0 +1,18 @@
+\caption{Error contribution breakdown (absolute values in scientific notation).}
+\label{tab:contribution_breakdown}
+\begin{tabular}{lrrrrrrrrrrrrrrrrrrr}
+\toprule
+Operator & Input & Weight & Accum & Demote & StatComp & Output & Bias & Affine & MaxSub & Exp & SumAcc & Accum & Demote & MatMul1Acc & Scaling & softmax_numerical_error & matmul2_accumulation_error & output_demote_error & Total \\
+\midrule
+Conv2D & 4.57e-05 & 3.95e-05 & 5.31e-05 & 5.86e-05 & -- & -- & -- & -- & -- & -- & -- & -- & -- & -- & -- & -- & -- & -- & 1.97e-04 \\
+LayerNorm & 2.34e-03 & 4.22e-04 & -- & -- & 2.44e-04 & 3.87e-04 & 3.03e-04 & -- & -- & -- & -- & -- & -- & -- & -- & -- & -- & -- & 3.70e-03 \\
+BatchNorm & 9.25e-03 & -- & -- & -- & 6.76e-03 & 8.56e-03 & -- & 8.49e-03 & -- & -- & -- & -- & -- & -- & -- & -- & -- & -- & 3.31e-02 \\
+Softmax & 6.83e-03 & -- & -- & -- & -- & 4.22e-03 & -- & -- & 4.16e-03 & 4.17e-03 & 4.24e-03 & -- & -- & -- & -- & -- & -- & -- & 2.36e-02 \\
+AvgPooling & -- & -- & -- & -- & -- & -- & -- & -- & -- & -- & -- & 2.41e-07 & 9.39e-04 & -- & -- & -- & -- & -- & 9.40e-04 \\
+MaxPooling & -- & -- & -- & -- & -- & -- & -- & -- & -- & -- & -- & 2.41e-07 & 9.39e-04 & -- & -- & -- & -- & -- & 9.40e-04 \\
+Linear & 2.09e-04 & 1.72e-04 & 2.60e-04 & -- & -- & 2.38e-04 & 1.58e-04 & -- & -- & -- & -- & -- & -- & -- & -- & -- & -- & -- & 1.04e-03 \\
+MatMul & 1.09e-04 & 9.00e-05 & 1.33e-04 & 1.22e-04 & -- & -- & -- & -- & -- & -- & -- & -- & -- & -- & -- & -- & -- & -- & 4.54e-04 \\
+GEMM & 6.64e-05 & 1.68e-05 & 2.59e-04 & 3.68e-05 & -- & -- & -- & -- & -- & -- & -- & -- & -- & -- & -- & -- & -- & -- & 3.79e-04 \\
+Attention & 1.75e-04 & -- & -- & -- & -- & -- & -- & -- & -- & -- & -- & -- & -- & 1.21e-04 & 1.21e-04 & 1.31e-04 & 1.87e-04 & 1.76e-04 & 9.11e-04 \\
+\bottomrule
+\end{tabular}
